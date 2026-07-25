@@ -2,7 +2,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <limine.h>
-#include "io.h"
+
 #include "gdt.h"
 #include "graphics.h"
 #include "heap.h"
@@ -10,10 +10,12 @@
 #include "idt.h"
 #include "irq.h"
 #include "keyboard.h"
+#include "lapic.h"
 #include "page_allocator.h"
 #include "physical_memory.h"
 #include "pic.h"
 #include "terminal.h"
+#include "timer.h"
 
 __attribute__((used, section(".limine_requests")))
 static volatile uint64_t limine_base_revision[] =
@@ -182,8 +184,6 @@ void kmain(void)
 
     gdt_init();
     idt_init();
-    pic_init();
-    irq_init();
 
     hhdm_init(
         hhdm_request.response
@@ -202,6 +202,17 @@ void kmain(void)
     }
 
     terminal_init();
+
+    pic_init();
+    irq_init();
+
+    bool lapic_ready =
+        lapic_init();
+
+    irq_set_lapic_enabled(
+        lapic_ready
+    );
+
     keyboard_init();
 
     irq_register_handler(
@@ -209,16 +220,14 @@ void kmain(void)
         keyboard_irq_handler
     );
 
+    timer_init(100);
+
     irq_enable();
-
-
 
     for (;;)
     {
-        keyboard_poll();
-
         __asm__ volatile(
-            "pause"
+            "hlt"
             :
             :
             : "memory"

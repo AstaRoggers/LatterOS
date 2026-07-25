@@ -1,5 +1,7 @@
 #include "shell.h"
+
 #include "terminal.h"
+#include "timer.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -48,6 +50,50 @@ static bool character_is_space(
     );
 }
 
+static void uint64_to_string(
+    uint64_t value,
+    char *buffer
+)
+{
+    char temporary[21];
+    uint32_t length = 0;
+
+    if (value == 0)
+    {
+        buffer[0] = '0';
+        buffer[1] = '\0';
+        return;
+    }
+
+    while (value > 0)
+    {
+        temporary[length] =
+            (char)(
+                '0' +
+                value % 10
+            );
+
+        length++;
+        value /= 10;
+    }
+
+    for (
+        uint32_t index = 0;
+        index < length;
+        index++
+    )
+    {
+        buffer[index] =
+            temporary[
+                length -
+                index -
+                1
+            ];
+    }
+
+    buffer[length] = '\0';
+}
+
 static void command_help(
     const char *arguments
 );
@@ -61,6 +107,10 @@ static void command_version(
 );
 
 static void command_echo(
+    const char *arguments
+);
+
+static void command_ticks(
     const char *arguments
 );
 
@@ -88,6 +138,11 @@ static const shell_command_t commands[] = {
         "echo",
         "Print text",
         command_echo
+    },
+    {
+        "ticks",
+        "Show timer tick count",
+        command_ticks
     },
     {
         "panic",
@@ -151,6 +206,26 @@ static void command_echo(
     terminal_write_line(arguments);
 }
 
+static void command_ticks(
+    const char *arguments
+)
+{
+    (void)arguments;
+
+    char text[21];
+
+    uint64_to_string(
+        timer_ticks(),
+        text
+    );
+
+    terminal_write(
+        "Timer ticks: "
+    );
+
+    terminal_write_line(text);
+}
+
 static void command_panic(
     const char *arguments
 )
@@ -160,7 +235,9 @@ static void command_panic(
     __asm__ volatile("int3");
 }
 
-void shell_execute(const char *input)
+void shell_execute(
+    const char *input
+)
 {
     char command_name[32];
 

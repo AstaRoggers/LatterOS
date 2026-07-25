@@ -1,19 +1,25 @@
 #include "irq.h"
 
+#include "lapic.h"
 #include "panic.h"
 #include "pic.h"
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
 #define IRQ_COUNT        16
 #define IRQ_VECTOR_BASE  32
-#define IRQ_VECTOR_END   (IRQ_VECTOR_BASE + IRQ_COUNT - 1)
+#define IRQ_VECTOR_END   47
+#define SPURIOUS_VECTOR  255
 
 static irq_handler_t irq_handlers[IRQ_COUNT];
+static bool use_lapic;
 
 void irq_init(void)
 {
+    use_lapic = false;
+
     for (
         uint8_t irq = 0;
         irq < IRQ_COUNT;
@@ -23,6 +29,13 @@ void irq_init(void)
         irq_handlers[irq] = NULL;
         pic_set_mask(irq);
     }
+}
+
+void irq_set_lapic_enabled(
+    bool enabled
+)
+{
+    use_lapic = enabled;
 }
 
 void irq_register_handler(
@@ -40,9 +53,6 @@ void irq_register_handler(
 
     irq_handlers[irq] = handler;
 
-    /*
-     * Slave PIC interrupts travel through master IRQ 2.
-     */
     if (irq >= 8)
     {
         pic_clear_mask(2);
@@ -51,7 +61,9 @@ void irq_register_handler(
     pic_clear_mask(irq);
 }
 
-void irq_unregister_handler(uint8_t irq)
+void irq_unregister_handler(
+    uint8_t irq
+)
 {
     if (irq >= IRQ_COUNT)
     {
@@ -82,8 +94,15 @@ void irq_disable(void)
     );
 }
 
-void interrupt_dispatch(uint64_t vector)
+void interrupt_dispatch(
+    uint64_t vector
+)
 {
+    if (vector == SPURIOUS_VECTOR)
+    {
+        return;
+    }
+
     if (vector < IRQ_VECTOR_BASE)
     {
         kernel_panic(
@@ -95,7 +114,10 @@ void interrupt_dispatch(uint64_t vector)
     if (vector <= IRQ_VECTOR_END)
     {
         uint8_t irq =
-            (uint8_t)(vector - IRQ_VECTOR_BASE);
+            (uint8_t)(
+                vector -
+                IRQ_VECTOR_BASE
+            );
 
         irq_handler_t handler =
             irq_handlers[irq];
@@ -106,6 +128,12 @@ void interrupt_dispatch(uint64_t vector)
         }
 
         pic_send_eoi(irq);
+
+        if (use_lapic)
+        {
+            lapic_send_eoi();
+        }
+
         return;
     }
 
