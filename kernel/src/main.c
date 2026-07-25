@@ -1,19 +1,23 @@
-#include <stdint.h>
-#include <stddef.h>
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <limine.h>
-
-// Set the base revision to 6, this is recommended as this is the latest
-// base revision described by the Limine boot protocol specification.
-// See specification for further info.
+#include "io.h"
+#include "gdt.h"
+#include "graphics.h"
+#include "heap.h"
+#include "hhdm.h"
+#include "idt.h"
+#include "irq.h"
+#include "keyboard.h"
+#include "page_allocator.h"
+#include "physical_memory.h"
+#include "pic.h"
+#include "terminal.h"
 
 __attribute__((used, section(".limine_requests")))
-static volatile uint64_t limine_base_revision[] = LIMINE_BASE_REVISION(6);
-
-// The Limine requests can be placed anywhere, but it is important that
-// the compiler does not optimise them away, so, usually, they should
-// be made volatile or equivalent, _and_ they should be accessed at least
-// once or marked as used with the "used" attribute as done here.
+static volatile uint64_t limine_base_revision[] =
+    LIMINE_BASE_REVISION(6);
 
 __attribute__((used, section(".limine_requests")))
 static volatile struct limine_framebuffer_request framebuffer_request = {
@@ -21,55 +25,203 @@ static volatile struct limine_framebuffer_request framebuffer_request = {
     .revision = 0
 };
 
-// Finally, define the start and end markers for the Limine requests.
-// These can also be moved anywhere, to any .c file, as seen fit.
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_memmap_request memory_map_request = {
+    .id = LIMINE_MEMMAP_REQUEST_ID,
+    .revision = 0
+};
+
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_hhdm_request hhdm_request = {
+    .id = LIMINE_HHDM_REQUEST_ID,
+    .revision = 0
+};
 
 __attribute__((used, section(".limine_requests_start")))
-static volatile uint64_t limine_requests_start_marker[] = LIMINE_REQUESTS_START_MARKER;
+static volatile uint64_t limine_requests_start_marker[] =
+    LIMINE_REQUESTS_START_MARKER;
 
 __attribute__((used, section(".limine_requests_end")))
-static volatile uint64_t limine_requests_end_marker[] = LIMINE_REQUESTS_END_MARKER;
+static volatile uint64_t limine_requests_end_marker[] =
+    LIMINE_REQUESTS_END_MARKER;
 
-// Halt and catch fire function.
-static void hcf(void) {
-    for (;;) {
-#if defined (__x86_64__)
-        asm ("hlt");
-#elif defined (__aarch64__) || defined (__riscv)
-        asm ("wfi");
-#elif defined (__loongarch64)
-        asm ("idle 0");
-#endif
+static void hcf(void)
+{
+    __asm__ volatile("cli");
+
+    for (;;)
+    {
+        __asm__ volatile("hlt");
     }
 }
 
-// The following will be our kernel's entry point.
-// If renaming kmain() to something else, make sure to change the
-// linker script accordingly.
-void kmain(void) {
-    // Ensure the bootloader actually understands our base revision (see spec).
-    if (LIMINE_BASE_REVISION_SUPPORTED(limine_base_revision) == false) {
-        hcf();
+static bool test_heap(void)
+{
+    uint64_t *numbers =
+        kmalloc(
+            32 * sizeof(uint64_t)
+        );
+
+    char *text =
+        kmalloc(128);
+
+    if (
+        numbers == NULL ||
+        text == NULL
+    )
+    {
+        return false;
     }
 
-    // Ensure we got a framebuffer.
-    if (framebuffer_request.response == NULL
-     || framebuffer_request.response->framebuffer_count < 1) {
-        hcf();
+    for (
+        uint64_t i = 0;
+        i < 32;
+        i++
+    )
+    {
+        numbers[i] =
+            0x1000000000000000ULL + i;
     }
 
-    // Fetch the first framebuffer.
-    struct limine_framebuffer *framebuffer = framebuffer_request.response->framebuffers[0];
+    for (
+        uint64_t i = 0;
+        i < 128;
+        i++
+    )
+    {
+        text[i] =
+            (char)(i & 0x7F);
+    }
 
-    // Print a nice pattern to screen as an example.
-    // Note: we assume the framebuffer model is RGB with 32-bit pixels.
-    volatile uint32_t *fb_ptr = framebuffer->address;
-    for (size_t y = 0; y < framebuffer->height; y++) {
-        for (size_t x = 0; x < framebuffer->width; x++) {
-            fb_ptr[y * (framebuffer->pitch / 4) + x] = 0x0000FF;
+    for (
+        uint64_t i = 0;
+        i < 32;
+        i++
+    )
+    {
+        if (
+            numbers[i] !=
+            0x1000000000000000ULL + i
+        )
+        {
+            return false;
         }
     }
 
-    // We're done, just hang...
-    hcf();
+    for (
+        uint64_t i = 0;
+        i < 128;
+        i++
+    )
+    {
+        if (
+            text[i] !=
+            (char)(i & 0x7F)
+        )
+        {
+            return false;
+        }
+    }
+
+    kfree(numbers);
+    kfree(text);
+
+    void *reused =
+        kmalloc(256);
+
+    if (reused == NULL)
+    {
+        return false;
+    }
+
+    kfree(reused);
+
+    return true;
+}
+
+void kmain(void)
+{
+    if (
+        !LIMINE_BASE_REVISION_SUPPORTED(
+            limine_base_revision
+        )
+    )
+    {
+        hcf();
+    }
+
+    if (
+        framebuffer_request.response == NULL ||
+        framebuffer_request.response
+            ->framebuffer_count < 1
+    )
+    {
+        hcf();
+    }
+
+    if (
+        memory_map_request.response == NULL ||
+        hhdm_request.response == NULL
+    )
+    {
+        hcf();
+    }
+
+    struct limine_framebuffer *framebuffer =
+        framebuffer_request.response
+            ->framebuffers[0];
+
+    graphics_init(
+        (uint32_t *)framebuffer->address,
+        framebuffer->pitch,
+        framebuffer->width,
+        framebuffer->height
+    );
+
+    graphics_clear(0x0066CC);
+
+    gdt_init();
+    idt_init();
+    pic_init();
+    irq_init();
+
+    hhdm_init(
+        hhdm_request.response
+    );
+
+    physical_memory_init(
+        memory_map_request.response
+    );
+
+    page_allocator_init();
+    heap_init();
+
+    if (!test_heap())
+    {
+        hcf();
+    }
+
+    terminal_init();
+    keyboard_init();
+
+    irq_register_handler(
+        1,
+        keyboard_irq_handler
+    );
+
+    irq_enable();
+
+
+
+    for (;;)
+    {
+        keyboard_poll();
+
+        __asm__ volatile(
+            "pause"
+            :
+            :
+            : "memory"
+        );
+    }
 }

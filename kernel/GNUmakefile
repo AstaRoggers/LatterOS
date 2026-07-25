@@ -1,71 +1,80 @@
 # Nuke built-in rules.
 .SUFFIXES:
 
-# This is the name that our final executable will have.
-# Change as needed.
+# Final kernel executable name.
 override OUTPUT := kernel
 
-# Target architecture to build for. Default to x86_64.
+# Target architecture.
 ARCH := x86_64
 
-# Install prefix; /usr/local is a good, standard default pick.
+# Install prefix.
 PREFIX := /usr/local
+
+# Required interrupt assembly source.
+override INTERRUPT_STUB_FILE := src/interrupt_stubs.S
 
 # Check if the architecture is supported.
 ifeq ($(filter $(ARCH),aarch64 loongarch64 riscv64 x86_64),)
     $(error Architecture $(ARCH) not supported)
 endif
 
-# User controllable toolchain and toolchain prefix.
+# User-controllable toolchain.
 TOOLCHAIN :=
 TOOLCHAIN_PREFIX :=
+
 ifneq ($(TOOLCHAIN),)
     ifeq ($(TOOLCHAIN_PREFIX),)
         TOOLCHAIN_PREFIX := $(TOOLCHAIN)-
     endif
 endif
 
-# User controllable C compiler command.
+# C compiler.
 ifneq ($(TOOLCHAIN_PREFIX),)
     CC := $(TOOLCHAIN_PREFIX)gcc
 else
     CC := cc
 endif
 
-# User controllable linker command.
+# Linker.
 LD := $(TOOLCHAIN_PREFIX)ld
 
-# Defaults overrides for variables if using "llvm" as toolchain.
+# LLVM toolchain configuration.
 ifeq ($(TOOLCHAIN),llvm)
     CC := clang
     LD := ld.lld
 endif
 
-# User controllable C flags.
+# User-controllable compiler flags.
 CFLAGS := -g -O2 -pipe
 
-# User controllable C preprocessor flags. We set none by default.
+# User-controllable preprocessor flags.
 CPPFLAGS :=
 
 ifeq ($(ARCH),x86_64)
-    # User controllable nasm flags.
     NASMFLAGS := -g
 endif
 
-# User controllable linker flags. We set none by default.
+# User-controllable linker flags.
 LDFLAGS :=
 
-# Ensure the dependencies have been obtained.
+# Ensure dependencies have been obtained.
 ifneq ($(filter-out clean distclean,$(or $(MAKECMDGOALS),default)),)
     ifeq ($(wildcard .deps-obtained),)
         $(error Please run the ./get-deps script first)
     endif
 endif
 
-# Check if CC is Clang.
+# Ensure the interrupt assembly file exists.
+ifneq ($(filter-out clean distclean,$(or $(MAKECMDGOALS),default)),)
+    ifeq ($(wildcard $(INTERRUPT_STUB_FILE)),)
+        $(error Missing $(INTERRUPT_STUB_FILE). Put interrupt_stubs.S inside kernel/src)
+    endif
+endif
+
+# Check whether CC is Clang.
 override CC_IS_CLANG := $(shell ! $(CC) --version 2>/dev/null | grep -q '^Target: '; echo $$?)
 
-# Internal C flags that should not be changed by the user.
+# Internal C flags.
 override CFLAGS += \
     -Wall \
     -Wextra \
@@ -79,7 +88,7 @@ override CFLAGS += \
     -ffunction-sections \
     -fdata-sections
 
-# Internal C preprocessor flags that should not be changed by the user.
+# Internal preprocessor flags.
 override CPPFLAGS := \
     -I src \
     -I limine-protocol/include \
@@ -89,18 +98,19 @@ override CPPFLAGS := \
     -MP
 
 ifeq ($(ARCH),x86_64)
-    # Internal nasm flags that should not be changed by the user.
     override NASMFLAGS := \
         $(patsubst -g,-g -F dwarf,$(NASMFLAGS)) \
         -Wall
 endif
 
-# Architecture specific internal flags.
+# Architecture-specific flags.
 ifeq ($(ARCH),x86_64)
+
     ifeq ($(CC_IS_CLANG),1)
         override CC += \
             -target x86_64-unknown-none-elf
     endif
+
     override CFLAGS += \
         -m64 \
         -march=x86-64 \
@@ -111,52 +121,70 @@ ifeq ($(ARCH),x86_64)
         -mno-sse2 \
         -mno-red-zone \
         -mcmodel=kernel
+
     override LDFLAGS += \
         -m elf_x86_64
+
     override NASMFLAGS := \
         -f elf64 \
         $(NASMFLAGS)
+
 endif
+
 ifeq ($(ARCH),aarch64)
+
     ifeq ($(CC_IS_CLANG),1)
         override CC += \
             -target aarch64-unknown-none-elf
     endif
+
     override CFLAGS += \
         -mcpu=generic \
         -march=armv8-a+nofp+nosimd \
         -mgeneral-regs-only
+
     override LDFLAGS += \
         -m aarch64elf
+
 endif
+
 ifeq ($(ARCH),riscv64)
+
     ifeq ($(CC_IS_CLANG),1)
         override CC += \
             -target riscv64-unknown-none-elf
     endif
+
     override CFLAGS += \
         -march=rv64imac_zicsr_zifencei \
         -mabi=lp64 \
         -mno-relax
+
     override LDFLAGS += \
         -m elf64lriscv \
         --no-relax
+
 endif
+
 ifeq ($(ARCH),loongarch64)
+
     ifeq ($(CC_IS_CLANG),1)
         override CC += \
             -target loongarch64-unknown-none-elf
     endif
+
     override CFLAGS += \
         -march=loongarch64 \
         -mabi=lp64s \
         -mfpu=none \
         -msimd=none
+
     override LDFLAGS += \
         -m elf64loongarch
+
 endif
 
-# Internal linker flags that should not be changed by the user.
+# Internal linker flags.
 override LDFLAGS += \
     -nostdlib \
     -static \
@@ -164,70 +192,104 @@ override LDFLAGS += \
     --gc-sections \
     -T linker-scripts/$(ARCH).lds
 
-# Use "find" to glob all *.c, *.S, and *.asm files in the tree
-# (except the src/arch/* directories, as those are gonna be added
-# in the next step).
-override SRCFILES := $(shell find -L src cc-runtime/src -type f -not -path 'src/arch/*' 2>/dev/null | LC_ALL=C sort)
-# Add architecture specific files, if they exist.
-override SRCFILES += $(shell find -L src/arch/$(ARCH) -type f 2>/dev/null | LC_ALL=C sort)
-# Obtain the object and header dependencies file names.
+# Find source files.
+override SRCFILES := $(shell find -L src cc-runtime/src \
+    -type f \
+    -not -path 'src/arch/*' \
+    2>/dev/null | LC_ALL=C sort)
+
+# Add architecture-specific files.
+override SRCFILES += $(shell find -L src/arch/$(ARCH) \
+    -type f \
+    2>/dev/null | LC_ALL=C sort)
+
+# Explicitly include interrupt_stubs.S.
+override SRCFILES += $(INTERRUPT_STUB_FILE)
+
+# Remove duplicate source paths.
+override SRCFILES := $(sort $(SRCFILES))
+
+# Separate source types.
 override CFILES := $(filter %.c,$(SRCFILES))
 override ASFILES := $(filter %.S,$(SRCFILES))
-ifeq ($(ARCH),x86_64)
-override NASMFILES := $(filter %.asm,$(SRCFILES))
-endif
-override OBJ := $(addprefix obj-$(ARCH)/,$(CFILES:.c=.c.o) $(ASFILES:.S=.S.o))
-ifeq ($(ARCH),x86_64)
-override OBJ += $(addprefix obj-$(ARCH)/,$(NASMFILES:.asm=.asm.o))
-endif
-override HEADER_DEPS := $(addprefix obj-$(ARCH)/,$(CFILES:.c=.c.d) $(ASFILES:.S=.S.d))
 
-# Default target. This must come first, before header dependencies.
+ifeq ($(ARCH),x86_64)
+    override NASMFILES := $(filter %.asm,$(SRCFILES))
+endif
+
+# Generate object paths.
+override OBJ := $(addprefix obj-$(ARCH)/,\
+    $(CFILES:.c=.c.o) \
+    $(ASFILES:.S=.S.o))
+
+ifeq ($(ARCH),x86_64)
+    override OBJ += $(addprefix obj-$(ARCH)/,\
+        $(NASMFILES:.asm=.asm.o))
+endif
+
+# Header dependency files.
+override HEADER_DEPS := $(addprefix obj-$(ARCH)/,\
+    $(CFILES:.c=.c.d) \
+    $(ASFILES:.S=.S.d))
+
+# Default target.
 .PHONY: all
 all: bin-$(ARCH)/$(OUTPUT)
 
-# Include header dependencies.
+# Include generated dependencies.
 -include $(HEADER_DEPS)
 
-# Link rules for the final executable.
+# Link the kernel.
 bin-$(ARCH)/$(OUTPUT): GNUmakefile linker-scripts/$(ARCH).lds $(OBJ)
 	mkdir -p "$(dir $@)"
 	$(LD) $(LDFLAGS) $(OBJ) -o $@
 
-# Compilation rules for *.c files.
+# Compile C files.
 obj-$(ARCH)/%.c.o: %.c GNUmakefile
 	mkdir -p "$(dir $@)"
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
-# Compilation rules for *.S files.
+# Compile preprocessed assembly files.
 obj-$(ARCH)/%.S.o: %.S GNUmakefile
 	mkdir -p "$(dir $@)"
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 ifeq ($(ARCH),x86_64)
-# Compilation rules for *.asm (nasm) files.
+
+# Compile NASM files.
 obj-$(ARCH)/%.asm.o: %.asm GNUmakefile
 	mkdir -p "$(dir $@)"
 	nasm $(NASMFLAGS) $< -o $@
+
 endif
 
-# Remove object files and the final executable.
+# Remove compiled files.
 .PHONY: clean
 clean:
 	rm -rf bin-$(ARCH) obj-$(ARCH)
 
-# Remove everything built and generated including downloaded dependencies.
+# Remove compiled files and dependencies.
 .PHONY: distclean
 distclean:
-	rm -rf bin-* obj-* .deps-obtained .cache compile_commands.json freestanding-c-hdrs cc-runtime limine-protocol
+	rm -rf \
+	    bin-* \
+	    obj-* \
+	    .deps-obtained \
+	    .cache \
+	    compile_commands.json \
+	    freestanding-c-hdrs \
+	    cc-runtime \
+	    limine-protocol
 
-# Install the final built executable to its final on-root location.
+# Install kernel.
 .PHONY: install
 install: all
 	install -d "$(DESTDIR)$(PREFIX)/share/$(OUTPUT)"
-	install -m 644 bin-$(ARCH)/$(OUTPUT) "$(DESTDIR)$(PREFIX)/share/$(OUTPUT)/$(OUTPUT)-$(ARCH)"
+	install -m 644 \
+	    bin-$(ARCH)/$(OUTPUT) \
+	    "$(DESTDIR)$(PREFIX)/share/$(OUTPUT)/$(OUTPUT)-$(ARCH)"
 
-# Try to undo whatever the "install" target did.
+# Uninstall kernel.
 .PHONY: uninstall
 uninstall:
 	rm -f "$(DESTDIR)$(PREFIX)/share/$(OUTPUT)/$(OUTPUT)-$(ARCH)"
