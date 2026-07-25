@@ -66,9 +66,7 @@ void kmain(void) {
     volatile uint32_t *fb_ptr = framebuffer->address;
     for (size_t y = 0; y < framebuffer->height; y++) {
         for (size_t x = 0; x < framebuffer->width; x++) {
-            uint32_t nX = x * 255 / framebuffer->width;
-            uint32_t nY = y * 255 / framebuffer->height;
-            fb_ptr[y * (framebuffer->pitch / 4) + x] = (nY << 8) | nX;
+            fb_ptr[y * (framebuffer->pitch / 4) + x] = 0x0000FF;
         }
     }
 
