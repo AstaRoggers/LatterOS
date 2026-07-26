@@ -12,8 +12,10 @@
 #include "keyboard.h"
 #include "lapic.h"
 #include "page_allocator.h"
+#include "pci.h"
 #include "physical_memory.h"
 #include "pic.h"
+#include "storage.h"
 #include "terminal.h"
 #include "timer.h"
 
@@ -200,6 +202,9 @@ void kmain(void)
     {
         hcf();
     }
+
+    pci_init();
+    storage_init();
 
     terminal_init();
 
