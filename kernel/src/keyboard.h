@@ -2,6 +2,9 @@
 #define KEYBOARD_H
 
 #include <stdbool.h>
+#include <stdint.h>
+#include <stdint.h>
+#include <stdint.h>
 
 typedef enum
 {
@@ -67,6 +70,12 @@ void keyboard_set_character_handler(
 
 void keyboard_set_event_handler(
     keyboard_event_handler_t handler
+);
+
+void keyboard_set_usb_active(bool active);
+bool keyboard_usb_active(void);
+void keyboard_handle_usb_boot_report(
+    const uint8_t report[8]
 );
 
 #endif

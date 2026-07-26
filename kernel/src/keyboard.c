@@ -124,6 +124,10 @@ static bool extended_scancode;
 static keyboard_character_handler_t character_handler;
 static keyboard_event_handler_t event_handler;
 
+static bool usb_input_active;
+static uint8_t usb_previous_modifiers;
+static uint8_t usb_previous_keys[6];
+
 static bool character_is_letter(char character)
 {
     return
@@ -415,9 +419,452 @@ static void keyboard_read_data(void)
             return;
         }
 
-        keyboard_process_scancode(
-            inb(PS2_DATA_PORT)
+        uint8_t scancode =
+            inb(PS2_DATA_PORT);
+
+        if (!usb_input_active)
+        {
+            keyboard_process_scancode(
+                scancode
+            );
+        }
+    }
+}
+
+static bool usb_report_contains(
+    const uint8_t report[8],
+    uint8_t usage
+)
+{
+    for (
+        uint8_t index = 2;
+        index < 8;
+        index++
+    )
+    {
+        if (report[index] == usage)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool previous_report_contains(
+    uint8_t usage
+)
+{
+    for (
+        uint8_t index = 0;
+        index < 6;
+        index++
+    )
+    {
+        if (usb_previous_keys[index] == usage)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static keyboard_key_t usb_usage_key(
+    uint8_t usage
+)
+{
+    switch (usage)
+    {
+        case 0x28:
+            return KEYBOARD_KEY_ENTER;
+
+        case 0x29:
+            return KEYBOARD_KEY_ESCAPE;
+
+        case 0x2A:
+            return KEYBOARD_KEY_BACKSPACE;
+
+        case 0x2B:
+            return KEYBOARD_KEY_TAB;
+
+        case 0x2C:
+            return KEYBOARD_KEY_SPACE;
+
+        case 0x39:
+            return KEYBOARD_KEY_CAPS_LOCK;
+
+        case 0x3A:
+            return KEYBOARD_KEY_F1;
+
+        case 0x3B:
+            return KEYBOARD_KEY_F2;
+
+        case 0x3C:
+            return KEYBOARD_KEY_F3;
+
+        case 0x3D:
+            return KEYBOARD_KEY_F4;
+
+        case 0x3E:
+            return KEYBOARD_KEY_F5;
+
+        case 0x3F:
+            return KEYBOARD_KEY_F6;
+
+        case 0x40:
+            return KEYBOARD_KEY_F7;
+
+        case 0x41:
+            return KEYBOARD_KEY_F8;
+
+        case 0x42:
+            return KEYBOARD_KEY_F9;
+
+        case 0x43:
+            return KEYBOARD_KEY_F10;
+
+        case 0x44:
+            return KEYBOARD_KEY_F11;
+
+        case 0x45:
+            return KEYBOARD_KEY_F12;
+
+        case 0x07:
+            return KEYBOARD_KEY_D;
+
+        case 0x09:
+            return KEYBOARD_KEY_F;
+
+        case 0x14:
+            return KEYBOARD_KEY_Q;
+
+        case 0x17:
+            return KEYBOARD_KEY_T;
+
+        default:
+            return KEYBOARD_KEY_UNKNOWN;
+    }
+}
+
+static char usb_usage_character(
+    uint8_t usage
+)
+{
+    bool shift =
+        left_shift || right_shift;
+
+    if (
+        usage >= 0x04 &&
+        usage <= 0x1D
+    )
+    {
+        char character =
+            (char)(
+                'a' +
+                (usage - 0x04)
+            );
+
+        if (caps_lock != shift)
+        {
+            character =
+                (char)(
+                    character - 'a' + 'A'
+                );
+        }
+
+        return character;
+    }
+
+    static const char normal_digits[10] = {
+        '1','2','3','4','5',
+        '6','7','8','9','0'
+    };
+
+    static const char shifted_digits[10] = {
+        '!','@','#','$','%',
+        '^','&','*','(',')'
+    };
+
+    if (
+        usage >= 0x1E &&
+        usage <= 0x27
+    )
+    {
+        uint8_t index =
+            (uint8_t)(usage - 0x1E);
+
+        return shift ?
+            shifted_digits[index] :
+            normal_digits[index];
+    }
+
+    switch (usage)
+    {
+        case 0x28:
+            return '\n';
+
+        case 0x2A:
+            return '\b';
+
+        case 0x2B:
+            return '\t';
+
+        case 0x2C:
+            return ' ';
+
+        case 0x2D:
+            return shift ? '_' : '-';
+
+        case 0x2E:
+            return shift ? '+' : '=';
+
+        case 0x2F:
+            return shift ? '{' : '[';
+
+        case 0x30:
+            return shift ? '}' : ']';
+
+        case 0x31:
+            return shift ? '|' : '\\';
+
+        case 0x33:
+            return shift ? ':' : ';';
+
+        case 0x34:
+            return shift ? '"' : '\'';
+
+        case 0x35:
+            return shift ? '~' : '`';
+
+        case 0x36:
+            return shift ? '<' : ',';
+
+        case 0x37:
+            return shift ? '>' : '.';
+
+        case 0x38:
+            return shift ? '?' : '/';
+
+        default:
+            return 0;
+    }
+}
+
+static void dispatch_usb_event(
+    keyboard_key_t key,
+    char character,
+    bool pressed
+)
+{
+    keyboard_event_t event = {
+        .key = key,
+        .character = character,
+        .pressed = pressed,
+        .shift = left_shift || right_shift,
+        .control = left_control || right_control,
+        .alt = left_alt || right_alt,
+        .super = super_key,
+        .caps_lock = caps_lock
+    };
+
+    bool consumed = false;
+
+    if (event_handler != NULL)
+    {
+        consumed = event_handler(&event);
+    }
+
+    if (
+        pressed &&
+        character != 0 &&
+        !consumed &&
+        !event.control &&
+        !event.alt &&
+        !event.super &&
+        character_handler != NULL
+    )
+    {
+        character_handler(character);
+    }
+}
+
+static keyboard_key_t usb_modifier_key(
+    uint8_t bit
+)
+{
+    switch (bit)
+    {
+        case 0:
+            return KEYBOARD_KEY_LEFT_CONTROL;
+
+        case 1:
+            return KEYBOARD_KEY_LEFT_SHIFT;
+
+        case 2:
+            return KEYBOARD_KEY_LEFT_ALT;
+
+        case 3:
+            return KEYBOARD_KEY_SUPER;
+
+        case 4:
+            return KEYBOARD_KEY_RIGHT_CONTROL;
+
+        case 5:
+            return KEYBOARD_KEY_RIGHT_SHIFT;
+
+        case 6:
+            return KEYBOARD_KEY_RIGHT_ALT;
+
+        case 7:
+            return KEYBOARD_KEY_SUPER;
+
+        default:
+            return KEYBOARD_KEY_UNKNOWN;
+    }
+}
+
+void keyboard_set_usb_active(bool active)
+{
+    usb_input_active = active;
+
+    if (!active)
+    {
+        usb_previous_modifiers = 0;
+
+        for (
+            uint8_t index = 0;
+            index < 6;
+            index++
+        )
+        {
+            usb_previous_keys[index] = 0;
+        }
+    }
+}
+
+bool keyboard_usb_active(void)
+{
+    return usb_input_active;
+}
+
+void keyboard_handle_usb_boot_report(
+    const uint8_t report[8]
+)
+{
+    if (
+        !usb_input_active ||
+        report == NULL
+    )
+    {
+        return;
+    }
+
+    uint8_t modifiers = report[0];
+    uint8_t changed =
+        (uint8_t)(
+            modifiers ^
+            usb_previous_modifiers
         );
+
+    for (
+        uint8_t bit = 0;
+        bit < 8;
+        bit++
+    )
+    {
+        uint8_t mask =
+            (uint8_t)(1U << bit);
+
+        if (!(changed & mask))
+        {
+            continue;
+        }
+
+        keyboard_key_t key =
+            usb_modifier_key(bit);
+
+        bool pressed =
+            (modifiers & mask) != 0;
+
+        update_modifier(
+            key,
+            pressed
+        );
+
+        dispatch_usb_event(
+            key,
+            0,
+            pressed
+        );
+    }
+
+    usb_previous_modifiers = modifiers;
+
+    for (
+        uint8_t index = 0;
+        index < 6;
+        index++
+    )
+    {
+        uint8_t usage =
+            usb_previous_keys[index];
+
+        if (
+            usage == 0 ||
+            usb_report_contains(
+                report,
+                usage
+            )
+        )
+        {
+            continue;
+        }
+
+        dispatch_usb_event(
+            usb_usage_key(usage),
+            0,
+            false
+        );
+    }
+
+    for (
+        uint8_t index = 2;
+        index < 8;
+        index++
+    )
+    {
+        uint8_t usage = report[index];
+
+        if (
+            usage == 0 ||
+            usage == 1 ||
+            previous_report_contains(usage)
+        )
+        {
+            continue;
+        }
+
+        if (usage == 0x39)
+        {
+            caps_lock = !caps_lock;
+        }
+
+        dispatch_usb_event(
+            usb_usage_key(usage),
+            usb_usage_character(usage),
+            true
+        );
+    }
+
+    for (
+        uint8_t index = 0;
+        index < 6;
+        index++
+    )
+    {
+        usb_previous_keys[index] =
+            report[index + 2];
     }
 }
 
@@ -443,6 +890,17 @@ void keyboard_init(void)
     caps_lock = false;
     caps_key_down = false;
     extended_scancode = false;
+    usb_previous_modifiers = 0;
+
+    for (
+        uint8_t index = 0;
+        index < 6;
+        index++
+    )
+    {
+        usb_previous_keys[index] = 0;
+    }
+
     character_handler = terminal_put_character;
     event_handler = NULL;
 }

@@ -11,8 +11,10 @@
 #define APIC_BASE_ENABLE    (1ULL << 11)
 #define APIC_BASE_X2APIC    (1ULL << 10)
 
+#define X2APIC_ID_MSR        0x802U
 #define X2APIC_TPR_MSR       0x808U
 #define X2APIC_EOI_MSR       0x80BU
+#define X2APIC_ICR_MSR       0x830U
 #define X2APIC_SVR_MSR       0x80FU
 #define X2APIC_LVT_TIMER_MSR 0x832U
 #define X2APIC_LVT_LINT0_MSR 0x835U
@@ -88,10 +90,8 @@ static void write_msr(
     );
 }
 
-bool lapic_init(void)
+static bool lapic_enable_current_cpu(void)
 {
-    enabled = false;
-
     uint32_t feature_ecx;
     uint32_t feature_edx;
 
@@ -131,11 +131,6 @@ bool lapic_init(void)
     );
 
     write_msr(
-        X2APIC_LVT_LINT0_MSR,
-        APIC_DELIVERY_EXTINT
-    );
-
-    write_msr(
         X2APIC_LVT_LINT1_MSR,
         APIC_LVT_MASKED
     );
@@ -163,9 +158,60 @@ bool lapic_init(void)
     return true;
 }
 
+bool lapic_init(void)
+{
+    return lapic_enable_current_cpu();
+}
+
+bool lapic_init_secondary(void)
+{
+    if (!lapic_enable_current_cpu())
+    {
+        return false;
+    }
+
+    /*
+     * Secondary processors do not receive the legacy PIC ExtINT
+     * input. External hardware IRQs remain targeted at the BSP
+     * until the SMP scheduler and per-CPU interrupt balancing land.
+     */
+    lapic_set_legacy_pic(false);
+
+    return true;
+}
+
 bool lapic_is_enabled(void)
 {
     return enabled;
+}
+
+uint32_t lapic_id(void)
+{
+    if (!enabled)
+    {
+        return 0;
+    }
+
+    return (uint32_t)read_msr(
+        X2APIC_ID_MSR
+    );
+}
+
+void lapic_set_legacy_pic(
+    bool legacy_enabled
+)
+{
+    if (!enabled)
+    {
+        return;
+    }
+
+    write_msr(
+        X2APIC_LVT_LINT0_MSR,
+        legacy_enabled ?
+            APIC_DELIVERY_EXTINT :
+            APIC_LVT_MASKED
+    );
 }
 
 void lapic_send_eoi(void)
@@ -179,4 +225,30 @@ void lapic_send_eoi(void)
         X2APIC_EOI_MSR,
         0
     );
+}
+
+
+bool lapic_send_ipi(
+    uint32_t destination_apic_id,
+    uint8_t vector
+)
+{
+    if (
+        !enabled ||
+        vector < 0x20
+    )
+    {
+        return false;
+    }
+
+    uint64_t command =
+        ((uint64_t)destination_apic_id << 32) |
+        (uint64_t)vector;
+
+    write_msr(
+        X2APIC_ICR_MSR,
+        command
+    );
+
+    return true;
 }

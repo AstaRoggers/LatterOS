@@ -189,3 +189,147 @@ user_apitest_end:
 .size user_apitest_start, . - user_apitest_start
 
 .section .note.GNU-stack,"",@progbits
+
+.section .rodata.user_security,"a",@progbits
+.code64
+
+.global user_sectest_start
+.global user_sectest_end
+.type user_sectest_start, @object
+
+user_sectest_start:
+    movw $0x1B, %ax
+    movw %ax, %ds
+    movw %ax, %es
+
+    /* Kernel pointers must be rejected at the syscall boundary. */
+    movabsq $0xFFFFFFFF80000000, %rdi
+    movq $8, %rsi
+    call user_sectest_runtime_console_write
+    cmpq $-1, %rax
+    jne user_sectest_failure
+
+    /* Create a small file using a readable code-page buffer. */
+    leaq user_sectest_path(%rip), %rdi
+    movq $(LATTER_OPEN_WRITE | LATTER_OPEN_CREATE | LATTER_OPEN_TRUNCATE), %rsi
+    call user_sectest_runtime_file_open
+    testq %rax, %rax
+    js user_sectest_failure
+
+    movq %rax, %r12
+    movq %r12, %rdi
+    leaq user_sectest_data(%rip), %rsi
+    movq $(user_sectest_data_end - user_sectest_data), %rdx
+    call user_sectest_runtime_file_write
+    cmpq $(user_sectest_data_end - user_sectest_data), %rax
+    jne user_sectest_failure_close
+
+    movq %r12, %rdi
+    call user_sectest_runtime_file_close
+    testq %rax, %rax
+    js user_sectest_failure
+
+    /* Reading into the read-only executable page must be rejected. */
+    leaq user_sectest_path(%rip), %rdi
+    movq $LATTER_OPEN_READ, %rsi
+    call user_sectest_runtime_file_open
+    testq %rax, %rax
+    js user_sectest_failure
+
+    movq %rax, %r12
+    movq %r12, %rdi
+    leaq user_sectest_readonly_target(%rip), %rsi
+    movq $4, %rdx
+    call user_sectest_runtime_file_read
+    cmpq $-1, %rax
+    jne user_sectest_failure_close
+
+    movq %r12, %rdi
+    call user_sectest_runtime_file_close
+    testq %rax, %rax
+    js user_sectest_failure
+
+    /* User processes cannot signal the kernel process. */
+    xorq %rdi, %rdi
+    call user_sectest_runtime_kill
+    cmpq $-1, %rax
+    jne user_sectest_failure
+
+    leaq user_sectest_success(%rip), %rdi
+    movq $(user_sectest_success_end - user_sectest_success), %rsi
+    call user_sectest_runtime_console_write
+
+    xorl %edi, %edi
+    call user_sectest_runtime_exit
+
+user_sectest_failure_close:
+    movq %r12, %rdi
+    call user_sectest_runtime_file_close
+
+user_sectest_failure:
+    leaq user_sectest_failure_message(%rip), %rdi
+    movq $(user_sectest_failure_message_end - user_sectest_failure_message), %rsi
+    call user_sectest_runtime_console_write
+
+    movl $1, %edi
+    call user_sectest_runtime_exit
+
+user_sectest_path:
+    .asciz "/tmp/security.txt"
+
+user_sectest_data:
+    .ascii "secure"
+user_sectest_data_end:
+
+user_sectest_readonly_target:
+    .ascii "READ"
+
+user_sectest_success:
+    .ascii "Security syscall validation passed.\n"
+user_sectest_success_end:
+
+user_sectest_failure_message:
+    .ascii "Security syscall validation failed.\n"
+user_sectest_failure_message_end:
+
+LATTER_RUNTIME user_sectest_runtime
+
+user_sectest_end:
+.size user_sectest_start, . - user_sectest_start
+
+.global user_wxtest_start
+.global user_wxtest_end
+.type user_wxtest_start, @object
+
+user_wxtest_start:
+    movw $0x1B, %ax
+    movw %ax, %ds
+    movw %ax, %es
+
+    leaq user_wxtest_message(%rip), %rdi
+    movq $(user_wxtest_message_end - user_wxtest_message), %rsi
+    call user_wxtest_runtime_console_write
+
+    /* Deliberately attempt to modify the read-only executable page. */
+    leaq user_wxtest_start(%rip), %rax
+    movb $0x90, (%rax)
+
+    leaq user_wxtest_failure(%rip), %rdi
+    movq $(user_wxtest_failure_end - user_wxtest_failure), %rsi
+    call user_wxtest_runtime_console_write
+
+    movl $1, %edi
+    call user_wxtest_runtime_exit
+
+user_wxtest_message:
+    .ascii "W^X test: attempting a code-page write.\n"
+user_wxtest_message_end:
+
+user_wxtest_failure:
+    .ascii "W^X test failed: code page was writable.\n"
+user_wxtest_failure_end:
+
+LATTER_RUNTIME user_wxtest_runtime
+
+user_wxtest_end:
+.size user_wxtest_start, . - user_wxtest_start

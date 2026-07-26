@@ -20,4 +20,11 @@ bool mouse_init(void);
 bool mouse_is_available(void);
 void mouse_get_state(mouse_state_t *state);
 
+void mouse_set_usb_active(bool active);
+bool mouse_usb_active(void);
+void mouse_handle_usb_boot_report(
+    const uint8_t *report,
+    uint8_t length
+);
+
 #endif

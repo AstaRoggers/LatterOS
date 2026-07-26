@@ -29,5 +29,6 @@ void idt_set_gate(
 );
 
 void idt_init(void);
+void idt_load(void);
 
 #endif

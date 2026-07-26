@@ -1,5 +1,6 @@
 #include "ramfs.h"
 
+#include "executable.h"
 #include "heap.h"
 #include "vfs.h"
 
@@ -12,6 +13,10 @@ extern const uint8_t user_spin_start[];
 extern const uint8_t user_spin_end[];
 extern const uint8_t user_apitest_start[];
 extern const uint8_t user_apitest_end[];
+extern const uint8_t user_sectest_start[];
+extern const uint8_t user_sectest_end[];
+extern const uint8_t user_wxtest_start[];
+extern const uint8_t user_wxtest_end[];
 
 #define RAMFS_FILE_CAPACITY 2048
 
@@ -55,13 +60,16 @@ static bool ramfs_move(
     const char *new_name
 );
 
+static bool ramfs_metadata(vfs_node_t *node);
+
 static const vfs_operations_t ramfs_operations = {
     .read = ramfs_read,
     .write = ramfs_write,
     .truncate = ramfs_truncate,
     .create = ramfs_create,
     .remove = ramfs_remove,
-    .move = ramfs_move
+    .move = ramfs_move,
+    .metadata = ramfs_metadata
 };
 
 static void clear_bytes(
@@ -130,6 +138,8 @@ static vfs_node_t *allocate_node(
     node->type = type;
     node->operations =
         &ramfs_operations;
+
+    vfs_initialize_metadata(node, type);
 
     if (type == VFS_NODE_FILE)
     {
@@ -356,6 +366,11 @@ static bool ramfs_move(
     );
 }
 
+static bool ramfs_metadata(vfs_node_t *node)
+{
+    return node != NULL;
+}
+
 bool ramfs_init(void)
 {
     vfs_node_t *root =
@@ -382,40 +397,11 @@ bool ramfs_init(void)
     }
 
 
-    if (!vfs_create_file("/bin/hello"))
-    {
-        return false;
-    }
-
-    vfs_node_t *hello_program =
-        vfs_open("/bin/hello");
-
     size_t hello_size =
         (size_t)(
             user_hello_end -
             user_hello_start
         );
-
-    if (
-        hello_program == NULL ||
-        vfs_write(
-            hello_program,
-            0,
-            user_hello_start,
-            hello_size
-        ) != hello_size
-    )
-    {
-        return false;
-    }
-
-    if (!vfs_create_file("/bin/spin"))
-    {
-        return false;
-    }
-
-    vfs_node_t *spin_program =
-        vfs_open("/bin/spin");
 
     size_t spin_size =
         (size_t)(
@@ -423,41 +409,55 @@ bool ramfs_init(void)
             user_spin_start
         );
 
-    if (
-        spin_program == NULL ||
-        vfs_write(
-            spin_program,
-            0,
-            user_spin_start,
-            spin_size
-        ) != spin_size
-    )
-    {
-        return false;
-    }
-
-    if (!vfs_create_file("/bin/apitest"))
-    {
-        return false;
-    }
-
-    vfs_node_t *apitest_program =
-        vfs_open("/bin/apitest");
-
     size_t apitest_size =
         (size_t)(
             user_apitest_end -
             user_apitest_start
         );
 
+    size_t sectest_size =
+        (size_t)(
+            user_sectest_end -
+            user_sectest_start
+        );
+
+    size_t wxtest_size =
+        (size_t)(
+            user_wxtest_end -
+            user_wxtest_start
+        );
+
     if (
-        apitest_program == NULL ||
-        vfs_write(
-            apitest_program,
-            0,
+        !executable_install(
+            "/bin/hello",
+            user_hello_start,
+            hello_size,
+            0
+        ) ||
+        !executable_install(
+            "/bin/spin",
+            user_spin_start,
+            spin_size,
+            0
+        ) ||
+        !executable_install(
+            "/bin/apitest",
             user_apitest_start,
-            apitest_size
-        ) != apitest_size
+            apitest_size,
+            0
+        ) ||
+        !executable_install(
+            "/bin/sectest",
+            user_sectest_start,
+            sectest_size,
+            0
+        ) ||
+        !executable_install(
+            "/bin/wxtest",
+            user_wxtest_start,
+            wxtest_size,
+            0
+        )
     )
     {
         return false;

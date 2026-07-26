@@ -10,6 +10,7 @@
 #define GDT_TSS_SELECTOR         0x28
 
 void gdt_init(void);
+void gdt_load_secondary(void);
 
 void gdt_set_kernel_stack(
     uint64_t stack_top

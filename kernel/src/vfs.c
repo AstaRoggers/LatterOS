@@ -1,6 +1,7 @@
 #include "vfs.h"
 
 #include "heap.h"
+#include "security.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -10,6 +11,201 @@
 
 static vfs_node_t *root_node;
 static vfs_node_t *current_directory;
+
+static uint16_t access_bits_for_identity(
+    const vfs_node_t *node,
+    uint32_t uid,
+    uint32_t gid
+)
+{
+    if (node == NULL)
+    {
+        return 0;
+    }
+
+    if (uid == node->owner_uid)
+    {
+        return (uint16_t)(
+            (node->mode >> 6) & 0x7U
+        );
+    }
+
+    if (gid == node->owner_gid)
+    {
+        return (uint16_t)(
+            (node->mode >> 3) & 0x7U
+        );
+    }
+
+    return (uint16_t)(node->mode & 0x7U);
+}
+
+void vfs_initialize_metadata(
+    vfs_node_t *node,
+    vfs_node_type_t type
+)
+{
+    if (node == NULL)
+    {
+        return;
+    }
+
+    node->owner_uid = security_effective_uid();
+    node->owner_gid = security_effective_gid();
+    node->mode = type == VFS_NODE_DIRECTORY ?
+        VFS_MODE_DIRECTORY_DEFAULT :
+        VFS_MODE_FILE_DEFAULT;
+}
+
+bool vfs_check_access(
+    const vfs_node_t *node,
+    uint8_t access
+)
+{
+    if (node == NULL)
+    {
+        return false;
+    }
+
+    if (!security_is_ready())
+    {
+        return true;
+    }
+
+    if (
+        security_effective_uid() ==
+            SECURITY_UID_ROOT ||
+        security_effective_has_capability(
+            SECURITY_CAP_FILE_ADMIN
+        )
+    )
+    {
+        return true;
+    }
+
+    uint16_t bits = access_bits_for_identity(
+        node,
+        security_effective_uid(),
+        security_effective_gid()
+    );
+
+    if (
+        (access & VFS_ACCESS_READ) != 0 &&
+        (bits & 0x4U) == 0
+    )
+    {
+        return false;
+    }
+
+    if (
+        (access & VFS_ACCESS_WRITE) != 0 &&
+        (bits & 0x2U) == 0
+    )
+    {
+        return false;
+    }
+
+    if (
+        (access & VFS_ACCESS_EXECUTE) != 0 &&
+        (bits & 0x1U) == 0
+    )
+    {
+        return false;
+    }
+
+    return true;
+}
+
+static bool sync_metadata(vfs_node_t *node)
+{
+    if (node == NULL)
+    {
+        return false;
+    }
+
+    if (
+        node->operations == NULL ||
+        node->operations->metadata == NULL
+    )
+    {
+        return true;
+    }
+
+    return node->operations->metadata(node);
+}
+
+bool vfs_chmod(
+    const char *path,
+    uint16_t mode
+)
+{
+    vfs_node_t *node = vfs_open(path);
+
+    if (
+        node == NULL ||
+        (mode & ~0777U) != 0
+    )
+    {
+        return false;
+    }
+
+    if (
+        security_is_ready() &&
+        security_effective_uid() !=
+            node->owner_uid &&
+        !security_effective_has_capability(
+            SECURITY_CAP_FILE_ADMIN
+        )
+    )
+    {
+        return false;
+    }
+
+    uint16_t previous = node->mode;
+    node->mode = mode;
+
+    if (!sync_metadata(node))
+    {
+        node->mode = previous;
+        return false;
+    }
+
+    return true;
+}
+
+bool vfs_chown(
+    const char *path,
+    uint32_t uid,
+    uint32_t gid
+)
+{
+    vfs_node_t *node = vfs_open(path);
+
+    if (
+        node == NULL ||
+        !security_effective_has_capability(
+            SECURITY_CAP_FILE_ADMIN
+        )
+    )
+    {
+        return false;
+    }
+
+    uint32_t previous_uid = node->owner_uid;
+    uint32_t previous_gid = node->owner_gid;
+
+    node->owner_uid = uid;
+    node->owner_gid = gid;
+
+    if (!sync_metadata(node))
+    {
+        node->owner_uid = previous_uid;
+        node->owner_gid = previous_gid;
+        return false;
+    }
+
+    return true;
+}
 
 static bool strings_equal(
     const char *first,
@@ -523,7 +719,11 @@ bool vfs_change_directory(const char *path)
 
     if (
         node == NULL ||
-        node->type != VFS_NODE_DIRECTORY
+        node->type != VFS_NODE_DIRECTORY ||
+        !vfs_check_access(
+            node,
+            VFS_ACCESS_EXECUTE
+        )
     )
     {
         return false;
@@ -562,6 +762,11 @@ static bool create_node(
 
     if (
         vfs_find_child(parent, name) != NULL ||
+        !vfs_check_access(
+            parent,
+            VFS_ACCESS_WRITE |
+                VFS_ACCESS_EXECUTE
+        ) ||
         parent->operations == NULL ||
         parent->operations->create == NULL
     )
@@ -662,8 +867,23 @@ bool vfs_remove(
     bool recursive
 )
 {
+    vfs_node_t *node = vfs_open(path);
+
+    if (
+        node == NULL ||
+        node->parent == NULL ||
+        !vfs_check_access(
+            node->parent,
+            VFS_ACCESS_WRITE |
+                VFS_ACCESS_EXECUTE
+        )
+    )
+    {
+        return false;
+    }
+
     return remove_node_recursive(
-        vfs_open(path),
+        node,
         recursive
     );
 }
@@ -742,7 +962,12 @@ bool vfs_rename(
     if (
         node == NULL ||
         node->parent == NULL ||
-        !valid_name(new_name)
+        !valid_name(new_name) ||
+        !vfs_check_access(
+            node->parent,
+            VFS_ACCESS_WRITE |
+                VFS_ACCESS_EXECUTE
+        )
     )
     {
         return false;
@@ -962,7 +1187,14 @@ bool vfs_copy(
     if (
         source == NULL ||
         source == root_node ||
-        destination_path == NULL
+        destination_path == NULL ||
+        (
+            source->type == VFS_NODE_FILE &&
+            !vfs_check_access(
+                source,
+                VFS_ACCESS_READ
+            )
+        )
     )
     {
         return false;
@@ -979,6 +1211,11 @@ bool vfs_copy(
             &parent,
             name,
             &existing
+        ) ||
+        !vfs_check_access(
+            parent,
+            VFS_ACCESS_WRITE |
+                VFS_ACCESS_EXECUTE
         )
     )
     {
@@ -1023,7 +1260,13 @@ bool vfs_move(
             source,
             current_directory
         ) ||
-        destination_path == NULL
+        destination_path == NULL ||
+        source->parent == NULL ||
+        !vfs_check_access(
+            source->parent,
+            VFS_ACCESS_WRITE |
+                VFS_ACCESS_EXECUTE
+        )
     )
     {
         return false;
@@ -1040,6 +1283,11 @@ bool vfs_move(
             &parent,
             name,
             &existing
+        ) ||
+        !vfs_check_access(
+            parent,
+            VFS_ACCESS_WRITE |
+                VFS_ACCESS_EXECUTE
         ) ||
         (
             existing != NULL &&
@@ -1099,6 +1347,10 @@ size_t vfs_read(
     if (
         node == NULL ||
         node->type != VFS_NODE_FILE ||
+        !vfs_check_access(
+            node,
+            VFS_ACCESS_READ
+        ) ||
         node->operations == NULL ||
         node->operations->read == NULL
     )
@@ -1124,6 +1376,10 @@ size_t vfs_write(
     if (
         node == NULL ||
         node->type != VFS_NODE_FILE ||
+        !vfs_check_access(
+            node,
+            VFS_ACCESS_WRITE
+        ) ||
         node->operations == NULL ||
         node->operations->write == NULL
     )
@@ -1137,6 +1393,25 @@ size_t vfs_write(
         buffer,
         count
     );
+}
+
+bool vfs_truncate(vfs_node_t *node)
+{
+    if (
+        node == NULL ||
+        node->type != VFS_NODE_FILE ||
+        !vfs_check_access(
+            node,
+            VFS_ACCESS_WRITE
+        ) ||
+        node->operations == NULL ||
+        node->operations->truncate == NULL
+    )
+    {
+        return false;
+    }
+
+    return node->operations->truncate(node);
 }
 
 bool vfs_write_text(
@@ -1167,15 +1442,13 @@ bool vfs_write_text(
 
     if (
         node == NULL ||
-        node->type != VFS_NODE_FILE ||
-        node->operations == NULL ||
-        node->operations->truncate == NULL
+        node->type != VFS_NODE_FILE
     )
     {
         return false;
     }
 
-    if (!node->operations->truncate(node))
+    if (!vfs_truncate(node))
     {
         return false;
     }

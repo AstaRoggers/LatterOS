@@ -1,6 +1,7 @@
 #include "syscall.h"
 
 #include "process.h"
+#include "security.h"
 #include "terminal.h"
 #include "vfs.h"
 
@@ -55,7 +56,7 @@ static bool copy_user_string(
 
         if (
             address < user_address ||
-            !process_user_range_valid(
+            !process_user_range_readable(
                 address,
                 1
             )
@@ -91,7 +92,7 @@ static uint64_t syscall_console_write(
 
     if (
         length > SYSCALL_TRANSFER_LIMIT ||
-        !process_user_range_valid(
+        !process_user_range_readable(
             user_address,
             (size_t)length
         )
@@ -230,9 +231,7 @@ static uint64_t syscall_file_open(
     {
         if (
             (flags & USER_OPEN_WRITE) == 0 ||
-            node->operations == NULL ||
-            node->operations->truncate == NULL ||
-            !node->operations->truncate(node)
+            !vfs_truncate(node)
         )
         {
             return SYSCALL_ERROR;
@@ -277,7 +276,7 @@ static uint64_t syscall_file_read(
 
     if (
         count > SYSCALL_TRANSFER_LIMIT ||
-        !process_user_range_valid(
+        !process_user_range_writable(
             user_buffer,
             (size_t)count
         )
@@ -328,7 +327,7 @@ static uint64_t syscall_file_write(
 
     if (
         count > SYSCALL_TRANSFER_LIMIT ||
-        !process_user_range_valid(
+        !process_user_range_readable(
             user_buffer,
             (size_t)count
         )
@@ -396,6 +395,15 @@ static uint64_t syscall_process_spawn(
     uint64_t user_path
 )
 {
+    if (
+        !security_effective_has_capability(
+            SECURITY_CAP_PROCESS_SPAWN
+        )
+    )
+    {
+        return SYSCALL_ERROR;
+    }
+
     char path[VFS_PATH_MAX];
 
     if (
@@ -421,6 +429,22 @@ static uint64_t syscall_process_kill(
     uint64_t pid
 )
 {
+    if (!process_user_may_signal(pid))
+    {
+        return SYSCALL_ERROR;
+    }
+
+    const process_t *current =
+        process_current();
+
+    if (
+        current != NULL &&
+        pid == current->pid
+    )
+    {
+        return 0;
+    }
+
     return process_terminate(pid) ?
         0 :
         SYSCALL_ERROR;
@@ -433,6 +457,15 @@ cpu_context_t *syscall_dispatch(
     if (context == NULL)
     {
         return NULL;
+    }
+
+    if (
+        (context->cs & 0x3ULL) != 0x3ULL ||
+        current_user_process() == NULL
+    )
+    {
+        context->rax = SYSCALL_ERROR;
+        return context;
     }
 
     switch (context->rax)
@@ -511,12 +544,31 @@ cpu_context_t *syscall_dispatch(
             return context;
 
         case SYSCALL_PROCESS_KILL:
+        {
+            const process_t *current =
+                process_current();
+
+            if (
+                current != NULL &&
+                context->rdi == current->pid &&
+                process_user_may_signal(
+                    context->rdi
+                )
+            )
+            {
+                return process_exit_from_syscall(
+                    context,
+                    -9
+                );
+            }
+
             context->rax =
                 syscall_process_kill(
                     context->rdi
                 );
 
             return context;
+        }
 
         case SYSCALL_PROCESS_YIELD:
             context->rax = 0;

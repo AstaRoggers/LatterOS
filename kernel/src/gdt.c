@@ -111,6 +111,36 @@ static void gdt_load(void)
     );
 }
 
+void gdt_load_secondary(void)
+{
+    /*
+     * AP worker interrupts never cross privilege levels, so they do
+     * not need to load the BSP's busy TSS descriptor. They only need
+     * the LatterOS code/data selectors used by the shared IDT.
+     */
+    __asm__ volatile(
+        "lgdt %0\n"
+
+        "mov %[data_selector], %%ax\n"
+        "mov %%ax, %%ds\n"
+        "mov %%ax, %%es\n"
+        "mov %%ax, %%ss\n"
+        "mov %%ax, %%fs\n"
+        "mov %%ax, %%gs\n"
+
+        "pushq %[code_selector]\n"
+        "leaq 1f(%%rip), %%rax\n"
+        "pushq %%rax\n"
+        "lretq\n"
+        "1:\n"
+        :
+        : "m"(gdt_descriptor),
+          [code_selector] "i"(GDT_KERNEL_CODE_SELECTOR),
+          [data_selector] "i"(GDT_KERNEL_DATA_SELECTOR)
+        : "rax", "memory"
+    );
+}
+
 void gdt_init(void)
 {
     clear_bytes(

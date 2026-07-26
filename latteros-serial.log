@@ -1,0 +1,48 @@
+[000001] INFO boot: LatterOS starting; framebuffer=1280x800 pitch=5120 serial=ready
+[000002] INFO cpu: GDT and IDT initialized
+[000003] INFO acpi: tables=ready root=RSDT cpus=4 ioapics=1
+[000004] INFO memory: usable=2079732 KiB pages=519933 free=262143
+[000005] INFO process: Process scheduler initialized
+[000006] INFO pci: devices=7 storage=detected
+[000007] INFO filesystem: LatterOS filesystem mounted; entries=8 used=138 bytes
+[000008] INFO security: session user=user uid=1000
+[000009] INFO filesystem: USB FAT filesystem mounted at /media/usb
+[000010] INFO usb: controller=ready connected=2 enumerated=4 keyboard=USB mouse=USB storage=1
+[000011] INFO network: RTL8139 and IPv4 stack initialized
+[000012] INFO interrupts: x2APIC=enabled controller=I/O APIC bsp-apic-id=0
+[000013] INFO timer: PIT configured at 1000 Hz
+[000014] INFO smp: discovered=4 online=4 mode=x2APIC ap-workers=3
+[000015] INFO desktop: Desktop startup requested
+[000016] INFO power: Reboot requested
+[000001] INFO boot: LatterOS starting; framebuffer=1280x800 pitch=5120 serial=ready
+[000002] INFO cpu: GDT and IDT initialized
+[000003] INFO acpi: tables=ready root=RSDT cpus=4 ioapics=1
+[000004] INFO memory: usable=2079732 KiB pages=519933 free=262143
+[000005] INFO process: Process scheduler initialized
+[000006] INFO pci: devices=7 storage=detected
+[000007] INFO filesystem: LatterOS filesystem mounted; entries=8 used=138 bytes
+[000008] INFO security: session user=user uid=1000
+[000009] INFO filesystem: USB FAT filesystem mounted at /media/usb
+[000010] INFO usb: controller=ready connected=2 enumerated=4 keyboard=USB mouse=USB storage=1
+[000011] INFO network: RTL8139 and IPv4 stack initialized
+[000012] INFO interrupts: x2APIC=enabled controller=I/O APIC bsp-apic-id=0
+[000013] INFO timer: PIT configured at 1000 Hz
+[000014] INFO smp: discovered=4 online=4 mode=x2APIC ap-workers=3
+[000015] INFO desktop: Desktop startup requested
+[000016] INFO power: Reboot requested
+[000001] INFO boot: LatterOS starting; framebuffer=1280x800 pitch=5120 serial=ready
+[000002] INFO cpu: GDT and IDT initialized
+[000003] INFO acpi: tables=ready root=RSDT cpus=4 ioapics=1
+[000004] INFO memory: usable=2079748 KiB pages=519937 free=262143
+[000005] INFO process: Process scheduler initialized
+[000006] INFO pci: devices=7 storage=detected
+[000007] INFO filesystem: LatterOS filesystem mounted; entries=8 used=138 bytes
+[000008] INFO security: session user=user uid=1000
+[000009] INFO filesystem: USB FAT filesystem mounted at /media/usb
+[000010] INFO usb: controller=ready connected=2 enumerated=4 keyboard=USB mouse=USB storage=1
+[000011] INFO network: RTL8139 and IPv4 stack initialized
+[000012] INFO interrupts: x2APIC=enabled controller=I/O APIC bsp-apic-id=0
+[000013] INFO timer: PIT configured at 1000 Hz
+[000014] INFO smp: discovered=4 online=4 mode=x2APIC ap-workers=3
+[000015] INFO desktop: Desktop startup requested
+[000016] INFO power: Shutdown requested

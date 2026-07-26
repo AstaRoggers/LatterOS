@@ -3,6 +3,7 @@
 #include "heap.h"
 #include "kstdio.h"
 #include "partition.h"
+#include "security.h"
 #include "terminal.h"
 #include "vfs.h"
 
@@ -47,7 +48,11 @@ typedef struct __attribute__((packed))
     uint32_t size;
     uint32_t generation;
     char name[32];
-    uint8_t reserved1[16];
+    uint32_t owner_uid;
+    uint32_t owner_gid;
+    uint16_t mode;
+    uint16_t metadata_version;
+    uint8_t reserved1[4];
 } latteros_fs_disk_entry_t;
 
 typedef struct
@@ -108,13 +113,18 @@ static bool latteros_fs_move(
     const char *new_name
 );
 
+static bool latteros_fs_metadata(
+    vfs_node_t *node
+);
+
 static const vfs_operations_t latteros_fs_operations = {
     .read = latteros_fs_read,
     .write = latteros_fs_write,
     .truncate = latteros_fs_truncate,
     .create = latteros_fs_create,
     .remove = latteros_fs_remove,
-    .move = latteros_fs_move
+    .move = latteros_fs_move,
+    .metadata = latteros_fs_metadata
 };
 
 _Static_assert(
@@ -388,6 +398,13 @@ static bool format_filesystem(void)
     entries[LATTEROS_FS_ROOT_INDEX].parent_index =
         LATTEROS_FS_NO_PARENT;
     entries[LATTEROS_FS_ROOT_INDEX].generation = 1;
+    entries[LATTEROS_FS_ROOT_INDEX].owner_uid =
+        SECURITY_UID_USER;
+    entries[LATTEROS_FS_ROOT_INDEX].owner_gid =
+        SECURITY_GID_USER;
+    entries[LATTEROS_FS_ROOT_INDEX].mode =
+        VFS_MODE_DIRECTORY_DEFAULT;
+    entries[LATTEROS_FS_ROOT_INDEX].metadata_version = 1;
 
     if (!write_entry(LATTEROS_FS_ROOT_INDEX))
     {
@@ -469,6 +486,9 @@ static vfs_node_t *allocate_node(
     node->type = type;
     node->size = entries[entry_index].size;
     node->operations = &latteros_fs_operations;
+    node->owner_uid = entries[entry_index].owner_uid;
+    node->owner_gid = entries[entry_index].owner_gid;
+    node->mode = entries[entry_index].mode;
     node->filesystem_data = data;
 
     return node;
@@ -511,6 +531,23 @@ static bool build_vfs_tree(void)
         else
         {
             return false;
+        }
+
+        if (
+            entry->metadata_version == 0 ||
+            entry->mode == 0
+        )
+        {
+            entry->owner_uid =
+                index == LATTEROS_FS_ROOT_INDEX ?
+                    SECURITY_UID_USER :
+                    SECURITY_UID_USER;
+            entry->owner_gid = SECURITY_GID_USER;
+            entry->mode = type == VFS_NODE_DIRECTORY ?
+                VFS_MODE_DIRECTORY_DEFAULT :
+                VFS_MODE_FILE_DEFAULT;
+            entry->metadata_version = 1;
+            (void)write_entry(index);
         }
 
         const char *name =
@@ -865,6 +902,15 @@ static vfs_node_t *latteros_fs_create(
     entries[index].parent_index =
         parent_data->entry_index;
     entries[index].generation = 1;
+    entries[index].owner_uid =
+        security_effective_uid();
+    entries[index].owner_gid =
+        security_effective_gid();
+    entries[index].mode =
+        type == VFS_NODE_DIRECTORY ?
+            VFS_MODE_DIRECTORY_DEFAULT :
+            VFS_MODE_FILE_DEFAULT;
+    entries[index].metadata_version = 1;
 
     if (
         !copy_name(
@@ -992,6 +1038,29 @@ static bool latteros_fs_move(
     }
 
     return true;
+}
+
+static bool latteros_fs_metadata(
+    vfs_node_t *node
+)
+{
+    latteros_fs_node_data_t *data =
+        node_data(node);
+
+    if (data == NULL)
+    {
+        return false;
+    }
+
+    uint32_t index = data->entry_index;
+
+    entries[index].owner_uid = node->owner_uid;
+    entries[index].owner_gid = node->owner_gid;
+    entries[index].mode = node->mode;
+    entries[index].metadata_version = 1;
+    entries[index].generation++;
+
+    return write_entry(index);
 }
 
 bool latteros_fs_init(void)

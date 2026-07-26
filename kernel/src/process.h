@@ -39,11 +39,17 @@ typedef struct
 typedef struct
 {
     uint64_t pid;
+    uint64_t parent_pid;
     char name[PROCESS_NAME_LENGTH];
+
+    uint32_t uid;
+    uint32_t gid;
+    uint64_t capabilities;
     process_state_t state;
     process_mode_t mode;
 
     cpu_context_t *context;
+    uint64_t page_table_root;
 
     void *kernel_stack_page;
     uint64_t kernel_stack_virtual;
@@ -79,6 +85,7 @@ uint64_t process_create_user_program(
 );
 
 bool process_terminate(uint64_t pid);
+bool process_user_may_signal(uint64_t pid);
 
 cpu_context_t *process_schedule_on_timer(
     cpu_context_t *context
@@ -93,7 +100,24 @@ cpu_context_t *process_exit_from_syscall(
     int64_t status
 );
 
+cpu_context_t *process_fault_from_exception(
+    cpu_context_t *context,
+    uint64_t vector,
+    uint64_t error_code,
+    uint64_t fault_address
+);
+
 void process_exit_current(void);
+
+bool process_user_range_readable(
+    uint64_t address,
+    size_t size
+);
+
+bool process_user_range_writable(
+    uint64_t address,
+    size_t size
+);
 
 bool process_user_range_valid(
     uint64_t address,

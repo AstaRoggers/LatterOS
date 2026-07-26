@@ -1,11 +1,13 @@
 #include "compositor.h"
 
 #include "graphics.h"
+#include "timer.h"
 
 #include <stddef.h>
 #include <stdint.h>
 
 #define COMPOSITOR_MAX_DIRTY_RECTS 24
+#define COMPOSITOR_FRAME_HISTORY 64
 
 static compositor_render_function_t render_function;
 
@@ -14,6 +16,16 @@ static ui_rect_t dirty_rectangles[
 ];
 
 static uint32_t dirty_count;
+
+static uint64_t rendered_frames;
+static uint64_t rendered_rectangles;
+static uint64_t rendered_pixels;
+static uint64_t statistics_started_at;
+static uint64_t render_ticks;
+static uint64_t present_ticks;
+static uint64_t frame_history[COMPOSITOR_FRAME_HISTORY];
+static uint32_t frame_history_count;
+static uint32_t frame_history_next;
 
 static uint64_t rectangle_area(
     const ui_rect_t *rectangle
@@ -160,6 +172,7 @@ void compositor_init(
 {
     render_function = renderer;
     dirty_count = 0;
+    compositor_reset_statistics();
 }
 
 void compositor_invalidate(
@@ -291,6 +304,22 @@ void compositor_render(void)
     uint32_t count = dirty_count;
     dirty_count = 0;
 
+    rendered_frames++;
+    rendered_rectangles += count;
+
+    for (uint32_t index = 0; index < count; index++)
+    {
+        rendered_pixels +=
+            rectangle_area(&dirty_rectangles[index]);
+    }
+
+    uint64_t started_at = timer_ticks();
+
+    /*
+     * Finish every dirty region in the software backbuffer before touching
+     * the visible framebuffer. Presenting while still rendering another
+     * region can expose half-updated cursor and window positions.
+     */
     for (uint32_t index = 0; index < count; index++)
     {
         const ui_rect_t *rectangle =
@@ -304,7 +333,17 @@ void compositor_render(void)
         );
 
         render_function();
-        graphics_reset_clip();
+    }
+
+    graphics_reset_clip();
+
+    uint64_t rendered_at = timer_ticks();
+    render_ticks += rendered_at - started_at;
+
+    for (uint32_t index = 0; index < count; index++)
+    {
+        const ui_rect_t *rectangle =
+            &dirty_rectangles[index];
 
         graphics_present_rectangle(
             (uint32_t)rectangle->x,
@@ -312,5 +351,154 @@ void compositor_render(void)
             rectangle->width,
             rectangle->height
         );
+    }
+
+    uint64_t presented_at = timer_ticks();
+    present_ticks += presented_at - rendered_at;
+
+    frame_history[frame_history_next] = presented_at;
+    frame_history_next =
+        (frame_history_next + 1) % COMPOSITOR_FRAME_HISTORY;
+
+    if (frame_history_count < COMPOSITOR_FRAME_HISTORY)
+    {
+        frame_history_count++;
+    }
+
+    /* The hardware cursor overlay is redrawn after all damaged pixels. */
+    graphics_cursor_refresh();
+}
+
+uint64_t compositor_frame_count(void)
+{
+    return rendered_frames;
+}
+
+uint64_t compositor_rectangle_count(void)
+{
+    return rendered_rectangles;
+}
+
+uint64_t compositor_pixel_count(void)
+{
+    return rendered_pixels;
+}
+
+uint32_t compositor_average_fps(void)
+{
+    uint64_t elapsed =
+        timer_ticks() - statistics_started_at;
+
+    uint32_t frequency = timer_frequency();
+
+    if (elapsed == 0 || frequency == 0)
+    {
+        return 0;
+    }
+
+    return (uint32_t)(
+        rendered_frames * frequency / elapsed
+    );
+}
+
+
+uint32_t compositor_recent_active_fps(void)
+{
+    if (frame_history_count < 2)
+    {
+        return 0;
+    }
+
+    uint32_t oldest_index;
+
+    if (frame_history_count < COMPOSITOR_FRAME_HISTORY)
+    {
+        oldest_index = 0;
+    }
+    else
+    {
+        oldest_index = frame_history_next;
+    }
+
+    uint32_t newest_index =
+        (frame_history_next + COMPOSITOR_FRAME_HISTORY - 1) %
+        COMPOSITOR_FRAME_HISTORY;
+
+    uint64_t elapsed =
+        frame_history[newest_index] -
+        frame_history[oldest_index];
+
+    uint32_t frequency = timer_frequency();
+
+    if (elapsed == 0 || frequency == 0)
+    {
+        return 0;
+    }
+
+    return (uint32_t)(
+        (uint64_t)(frame_history_count - 1) *
+        frequency /
+        elapsed
+    );
+}
+
+uint64_t compositor_average_render_ms(void)
+{
+    if (rendered_frames == 0)
+    {
+        return 0;
+    }
+
+    uint32_t frequency = timer_frequency();
+
+    if (frequency == 0)
+    {
+        return 0;
+    }
+
+    return
+        render_ticks * 1000 /
+        frequency /
+        rendered_frames;
+}
+
+uint64_t compositor_average_present_ms(void)
+{
+    if (rendered_frames == 0)
+    {
+        return 0;
+    }
+
+    uint32_t frequency = timer_frequency();
+
+    if (frequency == 0)
+    {
+        return 0;
+    }
+
+    return
+        present_ticks * 1000 /
+        frequency /
+        rendered_frames;
+}
+
+void compositor_reset_statistics(void)
+{
+    rendered_frames = 0;
+    rendered_rectangles = 0;
+    rendered_pixels = 0;
+    statistics_started_at = timer_ticks();
+    render_ticks = 0;
+    present_ticks = 0;
+    frame_history_count = 0;
+    frame_history_next = 0;
+
+    for (
+        uint32_t index = 0;
+        index < COMPOSITOR_FRAME_HISTORY;
+        index++
+    )
+    {
+        frame_history[index] = 0;
     }
 }

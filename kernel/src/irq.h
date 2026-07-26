@@ -14,6 +14,13 @@ void irq_set_lapic_enabled(
     bool enabled
 );
 
+void irq_set_ioapic_enabled(
+    bool enabled
+);
+
+bool irq_ioapic_enabled(void);
+const char *irq_controller_name(void);
+
 void irq_register_handler(
     uint8_t irq,
     irq_handler_t handler

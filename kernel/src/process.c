@@ -1,11 +1,14 @@
 #include "process.h"
 
+#include "executable.h"
 #include "gdt.h"
 #include "hhdm.h"
 #include "irq.h"
+#include "klog.h"
 #include "page_allocator.h"
 #include "paging.h"
 #include "physical_memory.h"
+#include "security.h"
 #include "terminal.h"
 #include "vfs.h"
 
@@ -171,17 +174,14 @@ static void destroy_process_slot(
         process->mode == PROCESS_USER
     )
     {
-        if (process->user_code_virtual != 0)
+        if (
+            process->page_table_root != 0 &&
+            process->page_table_root !=
+                paging_kernel_root()
+        )
         {
-            paging_unmap_page(
-                process->user_code_virtual
-            );
-        }
-
-        if (process->user_stack_virtual != 0)
-        {
-            paging_unmap_page(
-                process->user_stack_virtual
+            paging_destroy_user_space(
+                process->page_table_root
             );
         }
 
@@ -202,7 +202,8 @@ static void destroy_process_slot(
 
     if (process->kernel_stack_virtual != 0)
     {
-        (void)paging_unmap_page(
+        (void)paging_unmap_page_in(
+            paging_kernel_root(),
             process->kernel_stack_virtual
         );
     }
@@ -396,6 +397,23 @@ static void select_kernel_stack(
     }
 }
 
+static void select_address_space(
+    const process_t *process
+)
+{
+    uint64_t root = paging_kernel_root();
+
+    if (
+        process != NULL &&
+        process->page_table_root != 0
+    )
+    {
+        root = process->page_table_root;
+    }
+
+    paging_activate(root);
+}
+
 static cpu_context_t *schedule(
     cpu_context_t *context,
     bool charge_tick
@@ -449,6 +467,7 @@ static cpu_context_t *schedule(
             current->state =
                 PROCESS_RUNNING;
 
+            select_address_space(current);
             select_kernel_stack(current);
             return context;
         }
@@ -461,6 +480,7 @@ static cpu_context_t *schedule(
             PROCESS_RUNNING;
 
         current_index = 0;
+        select_address_space(kernel);
         select_kernel_stack(kernel);
 
         return kernel->context != NULL ?
@@ -472,6 +492,7 @@ static cpu_context_t *schedule(
     next->switches++;
     current_index = next_index;
 
+    select_address_space(next);
     select_kernel_stack(next);
 
     return next->context;
@@ -587,6 +608,9 @@ void process_init(void)
         &processes[0];
 
     kernel->pid = 0;
+    kernel->parent_pid = 0;
+    kernel->page_table_root =
+        paging_kernel_root();
     copy_name(
         kernel->name,
         "kernel"
@@ -594,6 +618,9 @@ void process_init(void)
 
     kernel->state = PROCESS_RUNNING;
     kernel->mode = PROCESS_KERNEL;
+    kernel->uid = SECURITY_UID_ROOT;
+    kernel->gid = SECURITY_GID_ROOT;
+    kernel->capabilities = SECURITY_CAP_ALL;
     kernel->switches = 1;
 
     current_index = 0;
@@ -668,9 +695,15 @@ bool process_create_kernel_thread(
     clear_process(process);
 
     process->pid = next_pid++;
+    process->parent_pid = 0;
+    process->page_table_root =
+        paging_kernel_root();
     copy_name(process->name, name);
     process->state = PROCESS_READY;
     process->mode = PROCESS_KERNEL;
+    process->uid = SECURITY_UID_ROOT;
+    process->gid = SECURITY_GID_ROOT;
+    process->capabilities = SECURITY_CAP_ALL;
     process->kernel_stack_page =
         kernel_stack_page;
 
@@ -761,14 +794,15 @@ uint64_t process_create_user_program(
         return 0;
     }
 
-    vfs_node_t *file =
-        vfs_open(path);
+    vfs_node_t *file = vfs_open(path);
 
     if (
         file == NULL ||
         file->type != VFS_NODE_FILE ||
-        file->size == 0 ||
-        file->size > PAGE_SIZE
+        !vfs_check_access(
+            file,
+            VFS_ACCESS_EXECUTE
+        )
     )
     {
         return 0;
@@ -781,12 +815,13 @@ uint64_t process_create_user_program(
     void *kernel_stack_page = NULL;
     void *user_code_page = NULL;
     void *user_stack_page = NULL;
+    uint64_t user_root = 0;
     uint64_t kernel_stack_virtual = 0;
     uint64_t code_virtual = 0;
     uint64_t stack_virtual = 0;
     bool kernel_stack_mapped = false;
-    bool code_mapped = false;
-    bool stack_mapped = false;
+    size_t image_size = 0;
+    uint32_t entry_offset = 0;
 
     int32_t slot = find_free_slot();
 
@@ -848,10 +883,15 @@ uint64_t process_create_user_program(
             (uint32_t)slot
         );
 
-    (void)paging_unmap_page(kernel_guard);
-    (void)paging_unmap_page(kernel_stack_virtual);
-    (void)paging_unmap_page(stack_guard);
-    (void)paging_unmap_page(stack_virtual);
+    (void)paging_unmap_page_in(
+        paging_kernel_root(),
+        kernel_guard
+    );
+
+    (void)paging_unmap_page_in(
+        paging_kernel_root(),
+        kernel_stack_virtual
+    );
 
     if (
         !paging_map_kernel_page(
@@ -867,44 +907,47 @@ uint64_t process_create_user_program(
     kernel_stack_mapped = true;
 
     if (
-        vfs_read(
+        !executable_load(
             file,
-            0,
             physical_to_virtual(
                 (uint64_t)user_code_page
             ),
-            file->size
-        ) != file->size
+            PAGE_SIZE,
+            &image_size,
+            &entry_offset
+        )
     )
     {
         goto finish;
     }
 
+    user_root =
+        paging_create_user_space();
+
+    if (user_root == 0)
+    {
+        goto finish;
+    }
+
     if (
-        !paging_map_user_page(
+        !paging_map_user_page_in(
+            user_root,
             code_virtual,
             (uint64_t)user_code_page,
+            false,
             true
-        )
-    )
-    {
-        goto finish;
-    }
-
-    code_mapped = true;
-
-    if (
-        !paging_map_user_page(
+        ) ||
+        !paging_map_user_page_in(
+            user_root,
             stack_virtual,
             (uint64_t)user_stack_page,
-            true
+            true,
+            false
         )
     )
     {
         goto finish;
     }
-
-    stack_mapped = true;
 
     process_t *process =
         &processes[slot];
@@ -912,6 +955,15 @@ uint64_t process_create_user_program(
     clear_process(process);
 
     process->pid = next_pid++;
+
+    const process_t *parent =
+        process_current();
+
+    process->parent_pid =
+        parent != NULL ?
+        parent->pid :
+        0;
+
     copy_name(
         process->name,
         path_name(path)
@@ -919,6 +971,28 @@ uint64_t process_create_user_program(
 
     process->state = PROCESS_READY;
     process->mode = PROCESS_USER;
+
+    if (
+        parent != NULL &&
+        parent->mode == PROCESS_USER
+    )
+    {
+        process->uid = parent->uid;
+        process->gid = parent->gid;
+        process->capabilities =
+            parent->capabilities;
+    }
+    else
+    {
+        process->uid =
+            security_session_uid();
+        process->gid =
+            security_session_gid();
+        process->capabilities =
+            security_session_capabilities();
+    }
+
+    process->page_table_root = user_root;
     process->kernel_stack_page =
         kernel_stack_page;
 
@@ -947,12 +1021,12 @@ uint64_t process_create_user_program(
         stack_guard;
 
     process->user_code_size =
-        file->size;
+        image_size;
 
     process->context =
         create_user_context(
             kernel_stack_virtual,
-            code_virtual,
+            code_virtual + entry_offset,
             stack_virtual
         );
 
@@ -961,23 +1035,20 @@ uint64_t process_create_user_program(
 finish:
     if (pid == 0)
     {
-        if (stack_mapped)
+        if (
+            user_root != 0 &&
+            user_root != paging_current_root()
+        )
         {
-            (void)paging_unmap_page(
-                stack_virtual
-            );
-        }
-
-        if (code_mapped)
-        {
-            (void)paging_unmap_page(
-                code_virtual
+            paging_destroy_user_space(
+                user_root
             );
         }
 
         if (kernel_stack_mapped)
         {
-            (void)paging_unmap_page(
+            (void)paging_unmap_page_in(
+                paging_kernel_root(),
                 kernel_stack_virtual
             );
         }
@@ -1000,6 +1071,60 @@ finish:
 
     interrupt_restore(interrupt_flags);
     return pid;
+}
+
+bool process_user_may_signal(uint64_t pid)
+{
+    const process_t *current =
+        process_current();
+
+    if (
+        current == NULL ||
+        current->mode != PROCESS_USER ||
+        pid == 0
+    )
+    {
+        return false;
+    }
+
+    if (pid == current->pid)
+    {
+        return true;
+    }
+
+    for (
+        uint32_t slot = 1;
+        slot < PROCESS_MAX_COUNT;
+        slot++
+    )
+    {
+        const process_t *target =
+            &processes[slot];
+
+        if (
+            target->state == PROCESS_UNUSED ||
+            target->pid != pid
+        )
+        {
+            continue;
+        }
+
+        if (
+            (current->capabilities &
+                SECURITY_CAP_PROCESS_ADMIN) != 0
+        )
+        {
+            return true;
+        }
+
+        return (
+            target->uid == current->uid &&
+            target->parent_pid ==
+                current->pid
+        );
+    }
+
+    return false;
 }
 
 bool process_terminate(uint64_t pid)
@@ -1107,6 +1232,54 @@ cpu_context_t *process_exit_from_syscall(
     );
 }
 
+cpu_context_t *process_fault_from_exception(
+    cpu_context_t *context,
+    uint64_t vector,
+    uint64_t error_code,
+    uint64_t fault_address
+)
+{
+    if (
+        !initialized ||
+        current_index == 0 ||
+        context == NULL
+    )
+    {
+        return context;
+    }
+
+    process_t *current =
+        &processes[current_index];
+
+    if (current->mode != PROCESS_USER)
+    {
+        return context;
+    }
+
+    klogf(
+        KLOG_WARNING,
+        "process",
+        "terminated user pid=%llu name=%s exception=%llu error=0x%llx address=0x%llx",
+        (unsigned long long)current->pid,
+        current->name,
+        (unsigned long long)vector,
+        (unsigned long long)error_code,
+        (unsigned long long)fault_address
+    );
+
+    current->context = context;
+    current->exit_status =
+        -(int64_t)(256 + vector);
+
+    current->state =
+        PROCESS_TERMINATED;
+
+    return schedule(
+        context,
+        false
+    );
+}
+
 void process_exit_current(void)
 {
     irq_disable();
@@ -1130,7 +1303,7 @@ void process_exit_current(void)
     }
 }
 
-bool process_user_range_valid(
+bool process_user_range_readable(
     uint64_t address,
     size_t size
 )
@@ -1138,39 +1311,47 @@ bool process_user_range_valid(
     const process_t *process =
         process_current();
 
-    if (
-        process == NULL ||
-        process->mode != PROCESS_USER ||
-        size == 0 ||
-        address > UINT64_MAX - size
-    )
-    {
-        return false;
-    }
+    return (
+        process != NULL &&
+        process->mode == PROCESS_USER &&
+        paging_user_range_valid(
+            process->page_table_root,
+            address,
+            size,
+            false
+        )
+    );
+}
 
-    uint64_t end = address + size;
+bool process_user_range_writable(
+    uint64_t address,
+    size_t size
+)
+{
+    const process_t *process =
+        process_current();
 
-    uint64_t code_start =
-        process->user_code_virtual;
+    return (
+        process != NULL &&
+        process->mode == PROCESS_USER &&
+        paging_user_range_valid(
+            process->page_table_root,
+            address,
+            size,
+            true
+        )
+    );
+}
 
-    uint64_t code_end =
-        code_start + PAGE_SIZE;
-
-    uint64_t stack_start =
-        process->user_stack_virtual;
-
-    uint64_t stack_end =
-        stack_start + PAGE_SIZE;
-
-    bool in_code =
-        address >= code_start &&
-        end <= code_end;
-
-    bool in_stack =
-        address >= stack_start &&
-        end <= stack_end;
-
-    return in_code || in_stack;
+bool process_user_range_valid(
+    uint64_t address,
+    size_t size
+)
+{
+    return process_user_range_readable(
+        address,
+        size
+    );
 }
 
 uint32_t process_count(void)
@@ -1359,10 +1540,12 @@ bool process_guard_pages_validate(void)
             process->mode == PROCESS_USER &&
             (
                 process->user_stack_guard == 0 ||
-                paging_is_mapped(
+                paging_is_mapped_in(
+                    process->page_table_root,
                     process->user_stack_guard
                 ) ||
-                !paging_is_mapped(
+                !paging_is_mapped_in(
+                    process->page_table_root,
                     process->user_stack_virtual
                 )
             )

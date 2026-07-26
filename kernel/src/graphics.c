@@ -27,6 +27,12 @@ static uint32_t *draw_buffer;
 static bool buffered;
 static bool deferred_mode;
 
+static bool cursor_overlay_visible;
+static int32_t cursor_overlay_x;
+static int32_t cursor_overlay_y;
+static uint64_t cursor_updates;
+static uint64_t surface_blits;
+
 static int32_t clip_x;
 static int32_t clip_y;
 static int32_t clip_right;
@@ -45,6 +51,161 @@ static uint64_t draw_stride(void)
     }
 
     return front_stride();
+}
+
+
+static void copy_pixels_unrolled(
+    uint32_t *destination,
+    const uint32_t *source,
+    uint64_t count
+)
+{
+    while (count >= 8)
+    {
+        destination[0] = source[0];
+        destination[1] = source[1];
+        destination[2] = source[2];
+        destination[3] = source[3];
+        destination[4] = source[4];
+        destination[5] = source[5];
+        destination[6] = source[6];
+        destination[7] = source[7];
+
+        destination += 8;
+        source += 8;
+        count -= 8;
+    }
+
+    while (count != 0)
+    {
+        *destination = *source;
+        destination++;
+        source++;
+        count--;
+    }
+}
+
+static void fill_pixels_unrolled(
+    uint32_t *destination,
+    uint32_t color,
+    uint64_t count
+)
+{
+    while (count >= 8)
+    {
+        destination[0] = color;
+        destination[1] = color;
+        destination[2] = color;
+        destination[3] = color;
+        destination[4] = color;
+        destination[5] = color;
+        destination[6] = color;
+        destination[7] = color;
+
+        destination += 8;
+        count -= 8;
+    }
+
+    while (count != 0)
+    {
+        *destination = color;
+        destination++;
+        count--;
+    }
+}
+
+static void draw_cursor_mask_to_front(
+    const uint16_t *rows,
+    uint32_t color
+)
+{
+    if (
+        rows == NULL ||
+        front_buffer == NULL
+    )
+    {
+        return;
+    }
+
+    uint64_t stride = front_stride();
+
+    for (uint32_t row = 0; row < 16; row++)
+    {
+        int32_t target_y =
+            cursor_overlay_y + (int32_t)row;
+
+        if (
+            target_y < 0 ||
+            target_y >= (int32_t)screen_height
+        )
+        {
+            continue;
+        }
+
+        for (uint32_t column = 0; column < 16; column++)
+        {
+            if (!(rows[row] & (uint16_t)(0x8000U >> column)))
+            {
+                continue;
+            }
+
+            int32_t target_x =
+                cursor_overlay_x + (int32_t)column;
+
+            if (
+                target_x < 0 ||
+                target_x >= (int32_t)screen_width
+            )
+            {
+                continue;
+            }
+
+            front_buffer[
+                (uint64_t)target_y * stride +
+                (uint32_t)target_x
+            ] = color;
+        }
+    }
+}
+
+static void draw_cursor_to_front(void)
+{
+    /*
+     * A black outline and white center keep the pointer visible over both
+     * dark desktop areas and bright window controls. The previous mostly
+     * white cursor could appear to vanish over terminal fields and borders.
+     */
+    static const uint16_t outline_rows[16] = {
+        0x8000, 0xC000, 0xE000, 0xF000,
+        0xF800, 0xFC00, 0xFE00, 0xFF00,
+        0xFF80, 0xFFC0, 0xFEC0, 0xCE60,
+        0x8E60, 0x0630, 0x0630, 0x0000
+    };
+
+    static const uint16_t fill_rows[16] = {
+        0x0000, 0x4000, 0x6000, 0x7000,
+        0x7800, 0x7C00, 0x7E00, 0x7F00,
+        0x7F00, 0x7C00, 0x6C00, 0x4400,
+        0x0400, 0x0200, 0x0200, 0x0000
+    };
+
+    if (
+        !cursor_overlay_visible ||
+        front_buffer == NULL
+    )
+    {
+        return;
+    }
+
+    draw_cursor_mask_to_front(
+        outline_rows,
+        0x000000
+    );
+
+    draw_cursor_mask_to_front(
+        fill_rows,
+        0xFFFFFF
+    );
 }
 
 static bool clip_rectangle(
@@ -143,6 +304,10 @@ void graphics_init(
         front_buffer;
 
     deferred_mode = false;
+    cursor_overlay_visible = false;
+    cursor_overlay_x = 0;
+    cursor_overlay_y = 0;
+    graphics_reset_motion_statistics();
     graphics_reset_clip();
 }
 
@@ -267,7 +432,7 @@ uint32_t graphics_get_pixel(
     ];
 }
 
-void graphics_present_rectangle(
+static void present_rectangle_raw(
     uint32_t x,
     uint32_t y,
     uint32_t width,
@@ -309,16 +474,59 @@ void graphics_present_rectangle(
         uint32_t *destination =
             &front_buffer[row * destination_stride + x];
 
-        for (
-            uint64_t column = x;
-            column < right;
-            column++
-        )
-        {
-            *destination = *source;
-            destination++;
-            source++;
-        }
+        copy_pixels_unrolled(
+            destination,
+            source,
+            right - x
+        );
+    }
+}
+
+static bool rectangle_overlaps_cursor(
+    uint32_t x,
+    uint32_t y,
+    uint32_t width,
+    uint32_t height
+)
+{
+    if (!cursor_overlay_visible)
+    {
+        return false;
+    }
+
+    int64_t right = (int64_t)x + width;
+    int64_t bottom = (int64_t)y + height;
+    int64_t cursor_right = cursor_overlay_x + 16;
+    int64_t cursor_bottom = cursor_overlay_y + 16;
+
+    return
+        (int64_t)x < cursor_right &&
+        right > cursor_overlay_x &&
+        (int64_t)y < cursor_bottom &&
+        bottom > cursor_overlay_y;
+}
+
+void graphics_present_rectangle(
+    uint32_t x,
+    uint32_t y,
+    uint32_t width,
+    uint32_t height
+)
+{
+    present_rectangle_raw(
+        x,
+        y,
+        width,
+        height
+    );
+
+    /*
+     * Any direct framebuffer presentation can cover the software cursor.
+     * Reapply it immediately when the updated rectangle intersects it.
+     */
+    if (rectangle_overlaps_cursor(x, y, width, height))
+    {
+        draw_cursor_to_front();
     }
 }
 
@@ -330,6 +538,217 @@ void graphics_present(void)
         screen_width,
         screen_height
     );
+}
+
+
+bool graphics_capture_rectangle(
+    uint32_t x,
+    uint32_t y,
+    uint32_t width,
+    uint32_t height,
+    uint32_t *destination,
+    uint32_t destination_stride
+)
+{
+    if (
+        draw_buffer == NULL ||
+        destination == NULL ||
+        width == 0 ||
+        height == 0 ||
+        destination_stride < width ||
+        x >= screen_width ||
+        y >= screen_height ||
+        (uint64_t)x + width > screen_width ||
+        (uint64_t)y + height > screen_height
+    )
+    {
+        return false;
+    }
+
+    uint64_t stride = draw_stride();
+
+    for (uint32_t row = 0; row < height; row++)
+    {
+        copy_pixels_unrolled(
+            &destination[(uint64_t)row * destination_stride],
+            &draw_buffer[(uint64_t)(y + row) * stride + x],
+            width
+        );
+    }
+
+    return true;
+}
+
+void graphics_blit_surface(
+    const uint32_t *source,
+    uint32_t source_stride,
+    uint32_t source_width,
+    uint32_t source_height,
+    int32_t destination_x,
+    int32_t destination_y
+)
+{
+    if (
+        source == NULL ||
+        draw_buffer == NULL ||
+        source_width == 0 ||
+        source_height == 0 ||
+        source_stride < source_width
+    )
+    {
+        return;
+    }
+
+    int32_t left = destination_x;
+    int32_t top = destination_y;
+    int32_t right =
+        destination_x + (int32_t)source_width;
+    int32_t bottom =
+        destination_y + (int32_t)source_height;
+
+    if (left < clip_x)
+    {
+        left = clip_x;
+    }
+
+    if (top < clip_y)
+    {
+        top = clip_y;
+    }
+
+    if (right > clip_right)
+    {
+        right = clip_right;
+    }
+
+    if (bottom > clip_bottom)
+    {
+        bottom = clip_bottom;
+    }
+
+    if (left < 0)
+    {
+        left = 0;
+    }
+
+    if (top < 0)
+    {
+        top = 0;
+    }
+
+    if (right > (int32_t)screen_width)
+    {
+        right = (int32_t)screen_width;
+    }
+
+    if (bottom > (int32_t)screen_height)
+    {
+        bottom = (int32_t)screen_height;
+    }
+
+    if (right <= left || bottom <= top)
+    {
+        return;
+    }
+
+    uint32_t source_x =
+        (uint32_t)(left - destination_x);
+    uint32_t source_y =
+        (uint32_t)(top - destination_y);
+    uint32_t copy_width =
+        (uint32_t)(right - left);
+    uint32_t copy_height =
+        (uint32_t)(bottom - top);
+    uint64_t stride = draw_stride();
+
+    for (uint32_t row = 0; row < copy_height; row++)
+    {
+        copy_pixels_unrolled(
+            &draw_buffer[
+                (uint64_t)(top + (int32_t)row) * stride +
+                (uint32_t)left
+            ],
+            &source[
+                (uint64_t)(source_y + row) * source_stride +
+                source_x
+            ],
+            copy_width
+        );
+    }
+
+    surface_blits++;
+}
+
+void graphics_cursor_show(int32_t x, int32_t y)
+{
+    if (!buffered || front_buffer == NULL)
+    {
+        return;
+    }
+
+    if (cursor_overlay_visible)
+    {
+        present_rectangle_raw(
+            (uint32_t)cursor_overlay_x,
+            (uint32_t)cursor_overlay_y,
+            16,
+            16
+        );
+    }
+
+    cursor_overlay_x = x;
+    cursor_overlay_y = y;
+    cursor_overlay_visible = true;
+    cursor_updates++;
+    draw_cursor_to_front();
+}
+
+void graphics_cursor_move(int32_t x, int32_t y)
+{
+    graphics_cursor_show(x, y);
+}
+
+void graphics_cursor_hide(void)
+{
+    if (!cursor_overlay_visible)
+    {
+        return;
+    }
+
+    int32_t old_x = cursor_overlay_x;
+    int32_t old_y = cursor_overlay_y;
+    cursor_overlay_visible = false;
+
+    if (old_x >= 0 && old_y >= 0)
+    {
+        present_rectangle_raw(
+            (uint32_t)old_x,
+            (uint32_t)old_y,
+            16,
+            16
+        );
+    }
+}
+
+void graphics_cursor_refresh(void)
+{
+    draw_cursor_to_front();
+}
+
+uint64_t graphics_cursor_update_count(void)
+{
+    return cursor_updates;
+}
+
+uint64_t graphics_surface_blit_count(void)
+{
+    return surface_blits;
+}
+
+void graphics_reset_motion_statistics(void)
+{
+    cursor_updates = 0;
+    surface_blits = 0;
 }
 
 void draw_pixel(
@@ -413,15 +832,11 @@ void draw_rectangle(
         uint32_t *destination =
             &draw_buffer[row * stride + clipped_x];
 
-        for (
-            uint64_t column = clipped_x;
-            column < end_x;
-            column++
-        )
-        {
-            *destination = color;
-            destination++;
-        }
+        fill_pixels_unrolled(
+            destination,
+            color,
+            end_x - clipped_x
+        );
     }
 
     if (buffered && !deferred_mode)
@@ -453,6 +868,18 @@ void draw_character(
     uint32_t color
 )
 {
+    if (
+        x >= screen_width ||
+        y >= screen_height ||
+        (int64_t)x + 8 <= clip_x ||
+        (int64_t)y + 8 <= clip_y ||
+        (int32_t)x >= clip_right ||
+        (int32_t)y >= clip_bottom
+    )
+    {
+        return;
+    }
+
     const uint8_t *bitmap =
         font_get_character(character);
 

@@ -7,6 +7,7 @@
 #include "mouse.h"
 #include "power.h"
 #include "rtc.h"
+#include "security.h"
 #include "shell.h"
 #include "terminal.h"
 #include "timer.h"
@@ -29,13 +30,20 @@
 #define EXPLORER_PREVIEW_COLUMNS 46
 
 #define GUI_CURSOR_SIZE 16
+#define GUI_TARGET_FRAME_RATE 60U
+#define GUI_POINTER_FIXED_SHIFT 8
+#define GUI_POINTER_FIXED_ONE (1 << GUI_POINTER_FIXED_SHIFT)
+#define GUI_DRAG_CACHE_MAX_WIDTH 1024U
+#define GUI_DRAG_CACHE_MAX_HEIGHT 768U
+#define GUI_DRAG_CACHE_MAX_PIXELS \
+    ((uint64_t)GUI_DRAG_CACHE_MAX_WIDTH * GUI_DRAG_CACHE_MAX_HEIGHT)
 #define TITLE_BAR_HEIGHT 24
 #define TASKBAR_HEIGHT 34
 #define LAUNCHER_ROW_HEIGHT 28
 #define LAUNCHER_WIDTH 210
 #define SYSTEM_MENU_WIDTH 190
 #define SYSTEM_MENU_ROW_HEIGHT 30
-#define SYSTEM_MENU_ROWS 4
+#define SYSTEM_MENU_ROWS 5
 
 #define COLOR_DESKTOP       0x1C4A72
 #define COLOR_TASKBAR       0x172330
@@ -143,23 +151,34 @@ static char explorer_preview[
 
 static int32_t cursor_x;
 static int32_t cursor_y;
+static int32_t cursor_target_x_fixed;
+static int32_t cursor_target_y_fixed;
 static int32_t last_mouse_x;
 static int32_t last_mouse_y;
 static uint64_t last_mouse_packets;
 static bool last_left_button;
 
-static uint32_t cursor_background[
-    GUI_CURSOR_SIZE * GUI_CURSOR_SIZE
-];
-
 static bool cursor_visible;
-static bool cursor_moved;
+
+static uint32_t drag_cache[GUI_DRAG_CACHE_MAX_PIXELS]
+    __attribute__((aligned(64)));
+static uint32_t drag_cache_width;
+static uint32_t drag_cache_height;
+static uint8_t drag_cache_window;
+static bool drag_cache_valid;
+
+static uint64_t last_frame_tick;
+static uint64_t frame_accumulator;
 static bool launcher_open;
 static bool system_menu_open;
 static char clock_text[6];
 static uint64_t last_clock_update;
 
 static void stop_gui(void);
+static void render_window(
+    uint8_t index,
+    const gui_window_t *window
+);
 
 static void clear_text(
     char *text,
@@ -208,83 +227,98 @@ static void copy_text(
     destination[index] = '\0';
 }
 
-static void hide_cursor(void)
+static int32_t absolute_value(int32_t value)
 {
-    if (!cursor_visible)
-    {
-        return;
-    }
-
-    for (
-        uint32_t row = 0;
-        row < GUI_CURSOR_SIZE;
-        row++
-    )
-    {
-        for (
-            uint32_t column = 0;
-            column < GUI_CURSOR_SIZE;
-            column++
-        )
-        {
-            draw_pixel(
-                (uint32_t)(cursor_x + (int32_t)column),
-                (uint32_t)(cursor_y + (int32_t)row),
-                cursor_background[
-                    row * GUI_CURSOR_SIZE + column
-                ]
-            );
-        }
-    }
-
-    graphics_present_rectangle(
-        (uint32_t)cursor_x,
-        (uint32_t)cursor_y,
-        GUI_CURSOR_SIZE,
-        GUI_CURSOR_SIZE
-    );
-
-    cursor_visible = false;
+    return value < 0 ? -value : value;
 }
 
-static void show_cursor(void)
+static int32_t pointer_scale_fixed(
+    int32_t delta_x,
+    int32_t delta_y
+)
 {
-    if (cursor_visible)
+    int32_t speed =
+        absolute_value(delta_x) +
+        absolute_value(delta_y);
+
+    /*
+     * Use a continuous acceleration curve. The old stepped thresholds
+     * changed sensitivity abruptly when a coalesced USB report crossed a
+     * boundary, which could make fast circular movement feel uneven.
+     */
+    int32_t bonus = speed * 8;
+
+    if (bonus > 96)
     {
-        return;
+        bonus = 96;
     }
 
-    for (
-        uint32_t row = 0;
-        row < GUI_CURSOR_SIZE;
-        row++
-    )
+    return GUI_POINTER_FIXED_ONE + bonus;
+}
+
+static void clamp_cursor_target(void)
+{
+    int32_t maximum_x =
+        (int32_t)graphics_width() - GUI_CURSOR_SIZE;
+
+    int32_t maximum_y =
+        (int32_t)graphics_height() - GUI_CURSOR_SIZE;
+
+    int32_t maximum_x_fixed =
+        maximum_x * GUI_POINTER_FIXED_ONE;
+
+    int32_t maximum_y_fixed =
+        maximum_y * GUI_POINTER_FIXED_ONE;
+
+    if (cursor_target_x_fixed < 0)
     {
-        for (
-            uint32_t column = 0;
-            column < GUI_CURSOR_SIZE;
-            column++
-        )
-        {
-            cursor_background[
-                row * GUI_CURSOR_SIZE + column
-            ] = graphics_get_pixel(
-                (uint32_t)(cursor_x + (int32_t)column),
-                (uint32_t)(cursor_y + (int32_t)row)
-            );
-        }
+        cursor_target_x_fixed = 0;
     }
 
-    ui_draw_cursor(cursor_x, cursor_y);
+    if (cursor_target_y_fixed < 0)
+    {
+        cursor_target_y_fixed = 0;
+    }
 
-    graphics_present_rectangle(
-        (uint32_t)cursor_x,
-        (uint32_t)cursor_y,
-        GUI_CURSOR_SIZE,
-        GUI_CURSOR_SIZE
-    );
+    if (cursor_target_x_fixed > maximum_x_fixed)
+    {
+        cursor_target_x_fixed = maximum_x_fixed;
+    }
 
-    cursor_visible = true;
+    if (cursor_target_y_fixed > maximum_y_fixed)
+    {
+        cursor_target_y_fixed = maximum_y_fixed;
+    }
+}
+
+static bool frame_is_due(void)
+{
+    uint32_t frequency = timer_frequency();
+    uint64_t now = timer_ticks();
+
+    if (frequency == 0)
+    {
+        return true;
+    }
+
+    if (now == last_frame_tick)
+    {
+        return false;
+    }
+
+    uint64_t elapsed = now - last_frame_tick;
+    last_frame_tick = now;
+
+    frame_accumulator +=
+        elapsed * GUI_TARGET_FRAME_RATE;
+
+    if (frame_accumulator < frequency)
+    {
+        return false;
+    }
+
+    frame_accumulator %= frequency;
+    return true;
 }
 
 static void queue_event(gui_event_t event)
@@ -1775,6 +1809,13 @@ static void render_taskbar(void)
     }
 
     ui_draw_text(
+        security_current_username(),
+        (int32_t)graphics_width() - 245,
+        taskbar.y + 13,
+        theme->light_text
+    );
+
+    ui_draw_text(
         clock_text,
         (int32_t)graphics_width() - 150,
         taskbar.y + 13,
@@ -1871,6 +1912,7 @@ static void render_system_menu(void)
     static const char *labels[
         SYSTEM_MENU_ROWS
     ] = {
+        "Switch user",
         "Terminal mode",
         "Restart",
         "Shut down",
@@ -2284,6 +2326,30 @@ static void render_window(
     }
 }
 
+
+static void render_cached_drag_window(
+    const gui_window_t *window
+)
+{
+    ui_rect_t shadow = {
+        .x = window->bounds.x + 5,
+        .y = window->bounds.y + 5,
+        .width = window->bounds.width,
+        .height = window->bounds.height
+    };
+
+    ui_fill_rect(&shadow, 0x10253A);
+
+    graphics_blit_surface(
+        drag_cache,
+        drag_cache_width,
+        drag_cache_width,
+        drag_cache_height,
+        window->bounds.x,
+        window->bounds.y
+    );
+}
+
 static void render_gui_scene(void)
 {
     uint8_t fullscreen =
@@ -2299,6 +2365,7 @@ static void render_gui_scene(void)
             fullscreen,
             &windows[fullscreen]
         );
+
         return;
     }
 
@@ -2311,7 +2378,19 @@ static void render_gui_scene(void)
     )
     {
         uint8_t index = window_order[order];
-        render_window(index, &windows[index]);
+
+        if (
+            drag_cache_valid &&
+            drag_cache_window == index &&
+            windows[index].dragging
+        )
+        {
+            render_cached_drag_window(&windows[index]);
+        }
+        else
+        {
+            render_window(index, &windows[index]);
+        }
     }
 
     render_taskbar();
@@ -2321,8 +2400,9 @@ static void render_gui_scene(void)
 
 static void stop_gui(void)
 {
-    hide_cursor();
-
+    graphics_cursor_hide();
+    cursor_visible = false;
+    drag_cache_valid = false;
     active = false;
     start_requested = false;
 
@@ -2366,6 +2446,53 @@ static void activate_window(uint8_t index)
 
     invalidate_visible_windows();
     invalidate_taskbar();
+}
+
+static void prepare_drag_cache(uint8_t index)
+{
+    drag_cache_valid = false;
+
+    if (index >= GUI_WINDOW_COUNT)
+    {
+        return;
+    }
+
+    gui_window_t *window = &windows[index];
+
+    if (
+        window->bounds.width > GUI_DRAG_CACHE_MAX_WIDTH ||
+        window->bounds.height > GUI_DRAG_CACHE_MAX_HEIGHT
+    )
+    {
+        return;
+    }
+
+    /*
+     * Activation can change z-order and title colors. Render that one-time
+     * change before taking the snapshot so every drag frame can use a cheap
+     * memory blit instead of redrawing text and controls.
+     */
+    if (compositor_has_damage())
+    {
+        compositor_render();
+    }
+
+    if (!graphics_capture_rectangle(
+        (uint32_t)window->bounds.x,
+        (uint32_t)window->bounds.y,
+        window->bounds.width,
+        window->bounds.height,
+        drag_cache,
+        window->bounds.width
+    ))
+    {
+        return;
+    }
+
+    drag_cache_width = window->bounds.width;
+    drag_cache_height = window->bounds.height;
+    drag_cache_window = index;
+    drag_cache_valid = true;
 }
 
 static bool handle_taskbar_click(
@@ -2529,17 +2656,30 @@ static void handle_mouse_down(
 
                 if (index == 0)
                 {
-                    stop_gui();
+                    security_logout();
+                    activate_window(0);
+                    terminal_focused = true;
+                    gui_terminal_append(
+                        "\nGuest session active.\n"
+                        "Use: login USER PASSWORD\n"
+                    );
+                    compositor_invalidate_all();
                     return;
                 }
 
                 if (index == 1)
                 {
-                    power_reboot();
+                    stop_gui();
                     return;
                 }
 
                 if (index == 2)
+                {
+                    power_reboot();
+                    return;
+                }
+
+                if (index == 3)
                 {
                     power_shutdown();
                     return;
@@ -2657,6 +2797,7 @@ static void handle_mouse_down(
                 !window->maximized
             )
             {
+                prepare_drag_cache(index);
                 window->dragging = true;
                 window->drag_offset_x =
                     x - window->bounds.x;
@@ -2788,6 +2929,49 @@ static void handle_mouse_down(
     terminal_focused = false;
 }
 
+static ui_rect_t union_rectangles(
+    const ui_rect_t *first,
+    const ui_rect_t *second
+)
+{
+    int32_t left =
+        first->x < second->x ?
+            first->x : second->x;
+
+    int32_t top =
+        first->y < second->y ?
+            first->y : second->y;
+
+    int64_t first_right =
+        (int64_t)first->x + first->width;
+
+    int64_t second_right =
+        (int64_t)second->x + second->width;
+
+    int64_t first_bottom =
+        (int64_t)first->y + first->height;
+
+    int64_t second_bottom =
+        (int64_t)second->y + second->height;
+
+    int64_t right =
+        first_right > second_right ?
+            first_right : second_right;
+
+    int64_t bottom =
+        first_bottom > second_bottom ?
+            first_bottom : second_bottom;
+
+    ui_rect_t rectangle = {
+        .x = left,
+        .y = top,
+        .width = (uint32_t)(right - left),
+        .height = (uint32_t)(bottom - top)
+    };
+
+    return rectangle;
+}
+
 static void handle_mouse_move(
     int32_t x,
     int32_t y
@@ -2824,12 +3008,27 @@ static void handle_mouse_move(
         ui_rect_t new_rectangle =
             window_visual_bounds(window);
 
-        compositor_invalidate(&old_rectangle);
-        compositor_invalidate(&new_rectangle);
+        ui_rect_t damage =
+            union_rectangles(
+                &old_rectangle,
+                &new_rectangle
+            );
+
+        compositor_invalidate(&damage);
     }
 
     if (moved_window)
     {
+        /*
+         * Drag frames are cheap because the active window is cached.
+         * Present them immediately at the USB report cadence instead of
+         * waiting for the normal 60 FPS desktop frame gate.
+         */
+        if (compositor_has_damage())
+        {
+            compositor_render();
+        }
+
         return;
     }
 
@@ -2879,6 +3078,8 @@ static void handle_mouse_move(
 
 static void handle_mouse_up(void)
 {
+    drag_cache_valid = false;
+
     for (
         uint8_t index = 0;
         index < GUI_WINDOW_COUNT;
@@ -3105,52 +3306,32 @@ static void process_events(void)
     }
 }
 
-static void update_mouse_events(void)
+static void commit_cursor_position(void)
 {
-    mouse_state_t state;
-    mouse_get_state(&state);
+    int32_t new_x =
+        (cursor_target_x_fixed +
+            GUI_POINTER_FIXED_ONE / 2) >>
+            GUI_POINTER_FIXED_SHIFT;
 
-    if (state.packet_count == last_mouse_packets)
+    int32_t new_y =
+        (cursor_target_y_fixed +
+            GUI_POINTER_FIXED_ONE / 2) >>
+            GUI_POINTER_FIXED_SHIFT;
+
+    if (
+        new_x == cursor_x &&
+        new_y == cursor_y
+    )
     {
         return;
     }
 
-    int32_t delta_x = state.x - last_mouse_x;
-    int32_t delta_y = state.y - last_mouse_y;
+    cursor_x = new_x;
+    cursor_y = new_y;
 
-    hide_cursor();
-
-    last_mouse_x = state.x;
-    last_mouse_y = state.y;
-    last_mouse_packets = state.packet_count;
-
-    cursor_x += delta_x;
-    cursor_y += delta_y;
-
-    int32_t maximum_x =
-        (int32_t)graphics_width() - GUI_CURSOR_SIZE;
-
-    int32_t maximum_y =
-        (int32_t)graphics_height() - GUI_CURSOR_SIZE;
-
-    if (cursor_x < 0)
+    if (cursor_visible)
     {
-        cursor_x = 0;
-    }
-
-    if (cursor_y < 0)
-    {
-        cursor_y = 0;
-    }
-
-    if (cursor_x > maximum_x)
-    {
-        cursor_x = maximum_x;
-    }
-
-    if (cursor_y > maximum_y)
-    {
-        cursor_y = maximum_y;
+        graphics_cursor_move(cursor_x, cursor_y);
     }
 
     gui_event_t move = {
@@ -3161,6 +3342,55 @@ static void update_mouse_events(void)
     };
 
     queue_event(move);
+}
+
+static void update_mouse_events(void)
+{
+    mouse_state_t state;
+    mouse_get_state(&state);
+
+    bool packet_changed =
+        state.packet_count != last_mouse_packets;
+
+    bool button_changed =
+        state.left_button != last_left_button;
+
+    if (packet_changed)
+    {
+        int32_t delta_x =
+            state.x - last_mouse_x;
+
+        int32_t delta_y =
+            state.y - last_mouse_y;
+
+        int32_t scale =
+            pointer_scale_fixed(
+                delta_x,
+                delta_y
+            );
+
+        cursor_target_x_fixed +=
+            delta_x * scale;
+
+        cursor_target_y_fixed +=
+            delta_y * scale;
+
+        clamp_cursor_target();
+
+        last_mouse_x = state.x;
+        last_mouse_y = state.y;
+        last_mouse_packets = state.packet_count;
+    }
+
+    /*
+     * Cursor movement uses a direct front-buffer overlay and is therefore
+     * cheap enough to commit on every USB report. Window damage is still
+     * coalesced and presented at the compositor frame cadence.
+     */
+    if (packet_changed || button_changed)
+    {
+        commit_cursor_position();
+    }
 
     if (
         state.left_button &&
@@ -3193,7 +3423,6 @@ static void update_mouse_events(void)
     }
 
     last_left_button = state.left_button;
-    cursor_moved = true;
 }
 
 static void start_gui(void)
@@ -3212,8 +3441,16 @@ static void start_gui(void)
 
     cursor_x = (int32_t)(screen_width / 2);
     cursor_y = (int32_t)(screen_height / 2);
-    cursor_visible = false;
-    cursor_moved = true;
+    cursor_target_x_fixed =
+        cursor_x * GUI_POINTER_FIXED_ONE;
+    cursor_target_y_fixed =
+        cursor_y * GUI_POINTER_FIXED_ONE;
+    cursor_visible = true;
+    drag_cache_valid = false;
+    drag_cache_window = GUI_WINDOW_COUNT;
+    graphics_cursor_show(cursor_x, cursor_y);
+    last_frame_tick = timer_ticks();
+    frame_accumulator = timer_frequency();
 
     mouse_state_t state;
     mouse_get_state(&state);
@@ -3371,7 +3608,12 @@ void gui_init(void)
     event_read_index = 0;
     event_write_index = 0;
     cursor_visible = false;
-    cursor_moved = false;
+    drag_cache_valid = false;
+    drag_cache_window = GUI_WINDOW_COUNT;
+    drag_cache_width = 0;
+    drag_cache_height = 0;
+    last_frame_tick = 0;
+    frame_accumulator = 0;
     launcher_open = false;
     system_menu_open = false;
     clock_text[0] = '-';
@@ -3381,6 +3623,14 @@ void gui_init(void)
     clock_text[4] = '-';
     clock_text[5] = '\0';
     last_clock_update = 0;
+}
+
+void gui_notify_session_changed(void)
+{
+    if (active)
+    {
+        invalidate_taskbar();
+    }
 }
 
 void gui_request_start(void)
@@ -3405,6 +3655,8 @@ void gui_update(void)
         return;
     }
 
+    bool render_frame = frame_is_due();
+
     update_clock(false);
     update_mouse_events();
     process_events();
@@ -3414,17 +3666,17 @@ void gui_update(void)
         return;
     }
 
-    if (compositor_has_damage())
+    /*
+     * All visual changes are accumulated in the software backbuffer and
+     * presented at a stable frame cadence. This coalesces USB mouse reports,
+     * window-drag updates, and cursor damage into one coherent frame.
+     */
+    if (
+        render_frame &&
+        compositor_has_damage()
+    )
     {
-        hide_cursor();
         compositor_render();
-        show_cursor();
-        cursor_moved = false;
-    }
-    else if (cursor_moved || !cursor_visible)
-    {
-        show_cursor();
-        cursor_moved = false;
     }
 }
 

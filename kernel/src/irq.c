@@ -1,10 +1,12 @@
 #include "irq.h"
 
+#include "ioapic.h"
 #include "lapic.h"
 #include "panic.h"
 #include "pic.h"
 #include "process.h"
 #include "syscall.h"
+#include "smp_scheduler.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -15,14 +17,17 @@
 #define IRQ_VECTOR_END   47
 #define SYSCALL_VECTOR   128
 #define SCHEDULER_VECTOR 129
+#define SMP_IPI_VECTOR   SMP_SCHEDULER_IPI_VECTOR
 #define SPURIOUS_VECTOR  255
 
 static irq_handler_t irq_handlers[IRQ_COUNT];
 static bool use_lapic;
+static bool use_ioapic;
 
 void irq_init(void)
 {
     use_lapic = false;
+    use_ioapic = false;
 
     for (
         uint8_t irq = 0;
@@ -42,6 +47,26 @@ void irq_set_lapic_enabled(
     use_lapic = enabled;
 }
 
+void irq_set_ioapic_enabled(
+    bool enabled
+)
+{
+    use_ioapic =
+        enabled && ioapic_is_ready();
+}
+
+bool irq_ioapic_enabled(void)
+{
+    return use_ioapic;
+}
+
+const char *irq_controller_name(void)
+{
+    return use_ioapic ?
+        "I/O APIC" :
+        "8259 PIC";
+}
+
 void irq_register_handler(
     uint8_t irq,
     irq_handler_t handler
@@ -56,6 +81,17 @@ void irq_register_handler(
     }
 
     irq_handlers[irq] = handler;
+
+    if (use_ioapic)
+    {
+        (void)ioapic_route_isa_irq(
+            irq,
+            (uint8_t)(IRQ_VECTOR_BASE + irq),
+            false
+        );
+
+        return;
+    }
 
     if (irq >= 8)
     {
@@ -74,7 +110,15 @@ void irq_unregister_handler(
         return;
     }
 
-    pic_set_mask(irq);
+    if (use_ioapic)
+    {
+        (void)ioapic_mask_isa_irq(irq);
+    }
+    else
+    {
+        pic_set_mask(irq);
+    }
+
     irq_handlers[irq] = NULL;
 }
 
@@ -120,8 +164,45 @@ cpu_context_t *interrupt_dispatch(
         );
     }
 
+    if (vector == SMP_IPI_VECTOR)
+    {
+        smp_scheduler_handle_ipi();
+
+        if (use_lapic)
+        {
+            lapic_send_eoi();
+        }
+
+        return context;
+    }
+
     if (vector < IRQ_VECTOR_BASE)
     {
+        bool from_user = (
+            context != NULL &&
+            (context->cs & 0x3ULL) == 0x3ULL
+        );
+
+        if (from_user)
+        {
+            uint64_t fault_address = 0;
+
+            if (vector == 14)
+            {
+                __asm__ volatile(
+                    "mov %%cr2, %0"
+                    : "=r"(fault_address)
+                );
+            }
+
+            return process_fault_from_exception(
+                context,
+                vector,
+                context->error_code,
+                fault_address
+            );
+        }
+
         kernel_panic_context(
             "Unhandled CPU exception",
             context
@@ -146,11 +227,21 @@ cpu_context_t *interrupt_dispatch(
             handler();
         }
 
-        pic_send_eoi(irq);
-
-        if (use_lapic)
+        if (use_ioapic)
         {
-            lapic_send_eoi();
+            if (use_lapic)
+            {
+                lapic_send_eoi();
+            }
+        }
+        else
+        {
+            pic_send_eoi(irq);
+
+            if (use_lapic)
+            {
+                lapic_send_eoi();
+            }
         }
 
         if (irq == 0)

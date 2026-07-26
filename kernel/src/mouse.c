@@ -2,6 +2,7 @@
 
 #include "io.h"
 #include "irq.h"
+#include "timer.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -29,6 +30,7 @@
 
 #define MOUSE_IRQ              12
 #define PS2_TIMEOUT            1000000U
+#define USB_MOUSE_TIMEOUT_MS 500ULL
 
 static volatile int32_t mouse_x;
 static volatile int32_t mouse_y;
@@ -38,6 +40,9 @@ static volatile uint64_t mouse_packets;
 static uint8_t packet[3];
 static uint8_t packet_index;
 static bool available;
+static bool usb_input_active;
+static bool usb_report_seen;
+static uint64_t usb_last_report_tick;
 
 static bool ps2_wait_input_empty(void)
 {
@@ -169,8 +174,51 @@ static bool mouse_send_command(
     return response == MOUSE_ACK;
 }
 
+static uint64_t usb_mouse_timeout_ticks(void)
+{
+    uint32_t frequency = timer_frequency();
+
+    if (frequency == 0)
+    {
+        return 50;
+    }
+
+    uint64_t ticks =
+        ((uint64_t)frequency *
+            USB_MOUSE_TIMEOUT_MS + 999ULL) /
+        1000ULL;
+
+    return ticks == 0 ? 1 : ticks;
+}
+
+static bool usb_mouse_recently_active(void)
+{
+    if (
+        !usb_input_active ||
+        !usb_report_seen
+    )
+    {
+        return false;
+    }
+
+    uint64_t now = timer_ticks();
+
+    return
+        now - usb_last_report_tick <=
+        usb_mouse_timeout_ticks();
+}
+
 static void mouse_process_packet(void)
 {
+    /*
+     * Keep consuming PS/2 packets so the controller does not clog,
+     * but prefer USB movement while valid USB reports are arriving.
+     */
+    if (usb_mouse_recently_active())
+    {
+        return;
+    }
+
     uint8_t flags = packet[0];
 
     mouse_buttons =
@@ -227,7 +275,7 @@ static void mouse_irq_handler(void)
 
 bool mouse_init(void)
 {
-    available = false;
+    available = usb_input_active;
     packet_index = 0;
 
     mouse_x = 0;
@@ -235,6 +283,14 @@ bool mouse_init(void)
     mouse_buttons = 0;
     mouse_packets = 0;
 
+    usb_report_seen = false;
+    usb_last_report_tick = 0;
+
+    /*
+     * Always initialize the PS/2 mouse as a live fallback. USB device
+     * enumeration alone does not prove that interrupt reports are
+     * actually arriving.
+     */
     irq_register_handler(
         MOUSE_IRQ,
         mouse_irq_handler
@@ -252,7 +308,7 @@ bool mouse_init(void)
     )
     {
         irq_unregister_handler(MOUSE_IRQ);
-        return false;
+        return available;
     }
 
     uint8_t configuration;
@@ -260,7 +316,7 @@ bool mouse_init(void)
     if (!ps2_read_data(&configuration))
     {
         irq_unregister_handler(MOUSE_IRQ);
-        return false;
+        return available;
     }
 
     configuration |=
@@ -277,7 +333,7 @@ bool mouse_init(void)
     )
     {
         irq_unregister_handler(MOUSE_IRQ);
-        return false;
+        return available;
     }
 
     if (
@@ -290,11 +346,79 @@ bool mouse_init(void)
     )
     {
         irq_unregister_handler(MOUSE_IRQ);
-        return false;
+        return available;
     }
 
     available = true;
     return true;
+}
+
+void mouse_set_usb_active(bool active)
+{
+    usb_input_active = active;
+
+    if (!active)
+    {
+        usb_report_seen = false;
+        usb_last_report_tick = 0;
+    }
+
+    if (active)
+    {
+        available = true;
+    }
+}
+
+bool mouse_usb_active(void)
+{
+    return usb_mouse_recently_active();
+}
+
+void mouse_handle_usb_boot_report(
+    const uint8_t *report,
+    uint8_t length
+)
+{
+    if (
+        !usb_input_active ||
+        report == NULL ||
+        length < 3
+    )
+    {
+        return;
+    }
+
+    uint8_t buttons =
+        (uint8_t)(report[0] & 0x07U);
+
+    int32_t delta_x =
+        (int32_t)(int8_t)report[1];
+
+    int32_t delta_y =
+        (int32_t)(int8_t)report[2];
+
+    /*
+     * Ignore an idle all-zero report as proof of a working USB mouse.
+     * Once a real movement or button change arrives, USB becomes the
+     * preferred source. If reports stop, PS/2 automatically takes over
+     * again after approximately half a second at any timer rate.
+     */
+    if (
+        delta_x == 0 &&
+        delta_y == 0 &&
+        buttons == mouse_buttons
+    )
+    {
+        return;
+    }
+
+    usb_report_seen = true;
+    usb_last_report_tick = timer_ticks();
+
+    mouse_buttons = buttons;
+    mouse_x += delta_x;
+    mouse_y += delta_y;
+    mouse_packets++;
 }
 
 bool mouse_is_available(void)

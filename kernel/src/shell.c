@@ -1,17 +1,24 @@
 #include "gui.h"
+#include "graphics.h"
 #include "heap.h"
 #include "shell.h"
 
+#include "acpi.h"
 #include "arp.h"
 #include "block_device.h"
+#include "compositor.h"
 #include "dhcp.h"
 #include "dns.h"
+#include "fat_fs.h"
 #include "kstdio.h"
 #include "klog.h"
 #include "kstdlib.h"
 #include "kstring.h"
 #include "icmp.h"
+#include "ioapic.h"
+#include "irq.h"
 #include "ipv4.h"
+#include "lapic.h"
 #include "latteros_fs.h"
 #include "mouse.h"
 #include "network.h"
@@ -22,15 +29,19 @@
 #include "power.h"
 #include "rtc.h"
 #include "serial.h"
+#include "security.h"
 #include "selftest.h"
 #include "stacktrace.h"
 #include "speaker.h"
+#include "smp.h"
+#include "smp_scheduler.h"
 #include "storage.h"
 #include "tcp.h"
 #include "terminal.h"
 #include "timer.h"
 #include "udp.h"
 #include "usb.h"
+#include "usb_mass_storage.h"
 #include "vfs.h"
 
 #include <stdbool.h>
@@ -203,6 +214,61 @@ static bool parse_uint64(
     return true;
 }
 
+static bool parse_octal_mode(
+    const char *text,
+    uint16_t *mode
+)
+{
+    if (
+        text == NULL ||
+        mode == NULL ||
+        text[0] == '\0'
+    )
+    {
+        return false;
+    }
+
+    uint16_t value = 0;
+    uint32_t index = 0;
+
+    while (text[index] != '\0')
+    {
+        if (
+            text[index] < '0' ||
+            text[index] > '7'
+        )
+        {
+            return false;
+        }
+
+        value = (uint16_t)(
+            value * 8U +
+            (uint16_t)(text[index] - '0')
+        );
+
+        if (value > 0777U)
+        {
+            return false;
+        }
+
+        index++;
+    }
+
+    *mode = value;
+    return true;
+}
+
+static void mode_to_string(
+    uint16_t mode,
+    char text[4]
+)
+{
+    text[0] = (char)('0' + ((mode >> 6) & 7U));
+    text[1] = (char)('0' + ((mode >> 3) & 7U));
+    text[2] = (char)('0' + (mode & 7U));
+    text[3] = '\0';
+}
+
 static void uint64_to_string(
     uint64_t value,
     char *buffer
@@ -287,7 +353,31 @@ static void command_ticks(
     const char *arguments
 );
 
+static void command_gfxstats(
+    const char *arguments
+);
+
 static void command_lspci(
+    const char *arguments
+);
+
+static void command_acpi(
+    const char *arguments
+);
+
+static void command_irqinfo(
+    const char *arguments
+);
+
+static void command_smp(
+    const char *arguments
+);
+
+static void command_smpwork(
+    const char *arguments
+);
+
+static void command_smpjobs(
     const char *arguments
 );
 
@@ -371,6 +461,50 @@ static void command_apitest(
     const char *arguments
 );
 
+static void command_securitytest(
+    const char *arguments
+);
+
+static void command_whoami(
+    const char *arguments
+);
+
+static void command_id(
+    const char *arguments
+);
+
+static void command_users(
+    const char *arguments
+);
+
+static void command_login(
+    const char *arguments
+);
+
+static void command_logout(
+    const char *arguments
+);
+
+static void command_caps(
+    const char *arguments
+);
+
+static void command_stat(
+    const char *arguments
+);
+
+static void command_chmod(
+    const char *arguments
+);
+
+static void command_chown(
+    const char *arguments
+);
+
+static void command_permtest(
+    const char *arguments
+);
+
 static void command_mouse(
     const char *arguments
 );
@@ -388,6 +522,14 @@ static void command_serialtest(
 );
 
 static void command_usb(
+    const char *arguments
+);
+
+static void command_usbms(
+    const char *arguments
+);
+
+static void command_fatinfo(
     const char *arguments
 );
 
@@ -526,9 +668,39 @@ static const shell_command_t commands[] = {
         command_ticks
     },
     {
+        "gfxstats",
+        "Show compositor performance: gfxstats [reset]",
+        command_gfxstats
+    },
+    {
         "lspci",
         "List detected PCI devices",
         command_lspci
+    },
+    {
+        "acpi",
+        "Show ACPI CPU and interrupt tables",
+        command_acpi
+    },
+    {
+        "irqinfo",
+        "Show active interrupt-controller routing",
+        command_irqinfo
+    },
+    {
+        "smp",
+        "Show multiprocessor startup and per-CPU state",
+        command_smp
+    },
+    {
+        "smpwork",
+        "Run parallel AP work: smpwork [iterations]",
+        command_smpwork
+    },
+    {
+        "smpjobs",
+        "Show AP work-queue status",
+        command_smpjobs
     },
     {
         "storage",
@@ -542,7 +714,7 @@ static const shell_command_t commands[] = {
     },
     {
         "diskread",
-        "Read one sector: diskread LBA",
+        "Read sector: diskread [DISK] LBA",
         command_diskread
     },
     {
@@ -631,6 +803,61 @@ static const shell_command_t commands[] = {
         command_apitest
     },
     {
+        "securitytest",
+        "Test user isolation and syscall validation",
+        command_securitytest
+    },
+    {
+        "whoami",
+        "Show the current login name",
+        command_whoami
+    },
+    {
+        "id",
+        "Show session UID, GID, and capabilities",
+        command_id
+    },
+    {
+        "users",
+        "List built-in user accounts",
+        command_users
+    },
+    {
+        "login",
+        "Switch account: login USER PASSWORD",
+        command_login
+    },
+    {
+        "logout",
+        "Switch to the guest session",
+        command_logout
+    },
+    {
+        "caps",
+        "Show current session capabilities",
+        command_caps
+    },
+    {
+        "stat",
+        "Show ownership and mode: stat PATH",
+        command_stat
+    },
+    {
+        "chmod",
+        "Change mode: chmod MODE PATH",
+        command_chmod
+    },
+    {
+        "chown",
+        "Change owner: chown USER PATH",
+        command_chown
+    },
+    {
+        "permtest",
+        "Test users, ownership, modes, and capabilities",
+        command_permtest
+    },
+    {
         "mouse",
         "Show PS/2 mouse state",
         command_mouse
@@ -654,6 +881,16 @@ static const shell_command_t commands[] = {
         "usb",
         "Show USB host controller status",
         command_usb
+    },
+    {
+        "usbms",
+        "Show USB mass-storage devices",
+        command_usbms
+    },
+    {
+        "fatinfo",
+        "Show mounted FAT filesystem status",
+        command_fatinfo
     },
     {
         "net",
@@ -863,12 +1100,330 @@ static void command_ticks(
     terminal_write_line(text);
 }
 
+static void command_gfxstats(
+    const char *arguments
+)
+{
+    if (strings_equal(arguments, "reset"))
+    {
+        compositor_reset_statistics();
+        graphics_reset_motion_statistics();
+        terminal_write_line(
+            "Graphics statistics reset"
+        );
+        return;
+    }
+
+    char text[21];
+
+    terminal_write("Timer frequency: ");
+    uint64_to_string(timer_frequency(), text);
+    terminal_write(text);
+    terminal_write_line(" Hz");
+
+    terminal_write("Idle-inclusive FPS: ");
+    uint64_to_string(
+        compositor_average_fps(),
+        text
+    );
+    terminal_write_line(text);
+
+    terminal_write("Recent active FPS: ");
+    uint64_to_string(
+        compositor_recent_active_fps(),
+        text
+    );
+    terminal_write_line(text);
+
+    terminal_write("Average render time: ");
+    uint64_to_string(
+        compositor_average_render_ms(),
+        text
+    );
+    terminal_write(text);
+    terminal_write_line(" ms");
+
+    terminal_write("Average present time: ");
+    uint64_to_string(
+        compositor_average_present_ms(),
+        text
+    );
+    terminal_write(text);
+    terminal_write_line(" ms");
+
+    uint64_t frames =
+        compositor_frame_count();
+
+    terminal_write("Rendered frames: ");
+    uint64_to_string(frames, text);
+    terminal_write_line(text);
+
+    terminal_write("Dirty rectangles: ");
+    uint64_to_string(
+        compositor_rectangle_count(),
+        text
+    );
+    terminal_write_line(text);
+
+    uint64_t pixels =
+        compositor_pixel_count();
+
+    terminal_write("Presented pixels: ");
+    uint64_to_string(pixels, text);
+    terminal_write_line(text);
+
+    terminal_write("Average pixels/frame: ");
+    uint64_to_string(
+        frames == 0 ? 0 : pixels / frames,
+        text
+    );
+    terminal_write_line(text);
+
+    terminal_write("Cursor fast-path updates: ");
+    uint64_to_string(
+        graphics_cursor_update_count(),
+        text
+    );
+    terminal_write_line(text);
+
+    terminal_write("Cached drag blits: ");
+    uint64_to_string(
+        graphics_surface_blit_count(),
+        text
+    );
+    terminal_write_line(text);
+
+    terminal_write("Framebuffer: ");
+    uint64_to_string(graphics_width(), text);
+    terminal_write(text);
+    terminal_write("x");
+    uint64_to_string(graphics_height(), text);
+    terminal_write_line(text);
+}
+
 static void command_lspci(
     const char *arguments
 )
 {
     (void)arguments;
     pci_print_devices();
+}
+
+static void command_acpi(
+    const char *arguments
+)
+{
+    (void)arguments;
+
+    if (!acpi_is_available())
+    {
+        terminal_write_line(
+            "ACPI MADT is not available"
+        );
+        return;
+    }
+
+    kprintf(
+        "ACPI: root=%s OEM=%s LAPIC=0x%llX\n",
+        acpi_root_table_name(),
+        acpi_oem_id(),
+        (unsigned long long)
+            acpi_local_apic_address()
+    );
+
+    kprintf(
+        "CPUs: %u  I/O APICs: %u  IRQ overrides: %u\n",
+        (unsigned int)acpi_cpu_count(),
+        (unsigned int)acpi_ioapic_count(),
+        (unsigned int)acpi_iso_count()
+    );
+
+    for (
+        uint32_t index = 0;
+        index < acpi_cpu_count();
+        index++
+    )
+    {
+        const acpi_cpu_info_t *cpu =
+            acpi_cpu(index);
+
+        if (cpu == NULL)
+        {
+            continue;
+        }
+
+        kprintf(
+            "CPU %u: APIC ID=%u UID=%u %s %s\n",
+            (unsigned int)index,
+            (unsigned int)cpu->apic_id,
+            (unsigned int)cpu->acpi_uid,
+            cpu->enabled ? "enabled" : "disabled",
+            cpu->x2apic ? "x2APIC" : "xAPIC"
+        );
+    }
+
+    for (
+        uint32_t index = 0;
+        index < acpi_ioapic_count();
+        index++
+    )
+    {
+        const acpi_ioapic_info_t *controller =
+            acpi_ioapic(index);
+
+        if (controller == NULL)
+        {
+            continue;
+        }
+
+        kprintf(
+            "I/O APIC %u: ID=%u address=0x%08X GSI base=%u\n",
+            (unsigned int)index,
+            (unsigned int)controller->id,
+            (unsigned int)controller->address,
+            (unsigned int)controller->gsi_base
+        );
+    }
+
+    for (
+        uint32_t index = 0;
+        index < acpi_iso_count();
+        index++
+    )
+    {
+        const acpi_iso_info_t *override =
+            acpi_iso(index);
+
+        if (override == NULL)
+        {
+            continue;
+        }
+
+        kprintf(
+            "IRQ override: IRQ%u -> GSI%u %s %s\n",
+            (unsigned int)override->source_irq,
+            (unsigned int)override->gsi,
+            override->active_low ?
+                "active-low" : "active-high",
+            override->level_triggered ?
+                "level" : "edge"
+        );
+    }
+}
+
+static void command_smp(
+    const char *arguments
+)
+{
+    (void)arguments;
+    smp_print_status();
+}
+
+static void command_smpwork(
+    const char *arguments
+)
+{
+    uint64_t iterations = 0;
+
+    if (
+        arguments != NULL &&
+        arguments[0] != '\0' &&
+        !parse_uint64(
+            arguments,
+            &iterations
+        )
+    )
+    {
+        kprintf(
+            "Usage: smpwork [iterations]\n"
+        );
+        return;
+    }
+
+    uint32_t submitted =
+        smp_scheduler_start_benchmark(
+            iterations
+        );
+
+    if (submitted == 0)
+    {
+        kprintf(
+            "No idle AP workers were available\n"
+        );
+        return;
+    }
+
+    kprintf(
+        "Scheduled parallel work on %u APs; use smpjobs to inspect progress\n",
+        (unsigned int)submitted
+    );
+}
+
+static void command_smpjobs(
+    const char *arguments
+)
+{
+    (void)arguments;
+    smp_scheduler_print_status();
+}
+
+static void command_irqinfo(
+    const char *arguments
+)
+{
+    (void)arguments;
+
+    kprintf(
+        "Interrupt controller: %s\n",
+        irq_controller_name()
+    );
+
+    kprintf(
+        "Local APIC: %s  BSP APIC ID: %u\n",
+        lapic_is_enabled() ? "enabled" : "unavailable",
+        (unsigned int)lapic_id()
+    );
+
+    kprintf(
+        "I/O APIC: %s  controllers=%u redirections=%u\n",
+        ioapic_is_ready() ? "ready" : "unavailable",
+        (unsigned int)ioapic_controller_count(),
+        (unsigned int)ioapic_redirection_count()
+    );
+
+    const uint8_t important_irqs[] = {
+        0, 1, 12
+    };
+
+    for (
+        uint32_t index = 0;
+        index < sizeof(important_irqs);
+        index++
+    )
+    {
+        uint32_t gsi;
+        bool active_low;
+        bool level_triggered;
+
+        if (
+            acpi_resolve_isa_irq(
+                important_irqs[index],
+                &gsi,
+                &active_low,
+                &level_triggered
+            )
+        )
+        {
+            kprintf(
+                "IRQ%u -> vector %u GSI%u %s %s\n",
+                (unsigned int)important_irqs[index],
+                (unsigned int)(32U + important_irqs[index]),
+                (unsigned int)gsi,
+                active_low ? "low" : "high",
+                level_triggered ? "level" : "edge"
+            );
+        }
+    }
 }
 
 static void command_storage(
@@ -891,8 +1446,59 @@ static void command_diskread(
     const char *arguments
 )
 {
-    const block_device_t *device =
-        storage_primary_device();
+    char first[24];
+    const char *remaining;
+
+    if (
+        !split_first_argument(
+            arguments,
+            first,
+            sizeof(first),
+            &remaining
+        )
+    )
+    {
+        terminal_write_line(
+            "Usage: diskread [DISK] LBA"
+        );
+        return;
+    }
+
+    const block_device_t *device = NULL;
+    uint64_t lba;
+
+    if (remaining[0] == '\0')
+    {
+        device = storage_primary_device();
+
+        if (!parse_uint64(first, &lba))
+        {
+            terminal_write_line(
+                "Usage: diskread [DISK] LBA"
+            );
+            return;
+        }
+    }
+    else
+    {
+        uint64_t disk_index;
+
+        if (
+            !parse_uint64(first, &disk_index) ||
+            !parse_uint64(remaining, &lba) ||
+            disk_index >= block_device_count()
+        )
+        {
+            terminal_write_line(
+                "Usage: diskread [DISK] LBA"
+            );
+            return;
+        }
+
+        device = block_device_get(
+            (uint32_t)disk_index
+        );
+    }
 
     if (device == NULL)
     {
@@ -902,12 +1508,13 @@ static void command_diskread(
         return;
     }
 
-    uint64_t lba;
-
-    if (!parse_uint64(arguments, &lba))
+    if (
+        device->sector_size >
+            DISK_SECTOR_BUFFER_SIZE
+    )
     {
         terminal_write_line(
-            "Usage: diskread LBA"
+            "Sector is larger than the diagnostic buffer"
         );
         return;
     }
@@ -932,6 +1539,9 @@ static void command_diskread(
     char lba_text[21];
     uint64_to_string(lba, lba_text);
     terminal_write(lba_text);
+
+    terminal_write(" from ");
+    terminal_write(device->name);
 
     terminal_write_line(
         " first 64 bytes:"
@@ -1469,6 +2079,16 @@ static void command_spawn(
 {
     (void)arguments;
 
+    if (
+        !security_has_capability(
+            SECURITY_CAP_PROCESS_ADMIN
+        )
+    )
+    {
+        terminal_write_line("Permission denied");
+        return;
+    }
+
     if (process_spawn_demo_thread())
     {
         terminal_write_line(
@@ -1487,6 +2107,16 @@ static void command_run(
     const char *arguments
 )
 {
+    if (
+        !security_has_capability(
+            SECURITY_CAP_PROCESS_SPAWN
+        )
+    )
+    {
+        terminal_write_line("Permission denied");
+        return;
+    }
+
     if (arguments[0] == '\0')
     {
         terminal_write_line(
@@ -1519,6 +2149,16 @@ static void command_kill(
     const char *arguments
 )
 {
+    if (
+        !security_has_capability(
+            SECURITY_CAP_PROCESS_ADMIN
+        )
+    )
+    {
+        terminal_write_line("Permission denied");
+        return;
+    }
+
     uint64_t pid;
 
     if (!parse_uint64(arguments, &pid))
@@ -1629,6 +2269,407 @@ static void command_apitest(
 
     terminal_write("Started API test process ");
     terminal_write_line(pid_text);
+}
+
+static void command_securitytest(
+    const char *arguments
+)
+{
+    (void)arguments;
+
+    uint64_t validation_pid =
+        process_create_user_program(
+            "/bin/sectest"
+        );
+
+    uint64_t wx_pid =
+        process_create_user_program(
+            "/bin/wxtest"
+        );
+
+    if (
+        validation_pid == 0 ||
+        wx_pid == 0
+    )
+    {
+        terminal_write_line(
+            "Unable to start security tests"
+        );
+        return;
+    }
+
+    terminal_write_line(
+        "Security tests started"
+    );
+
+    terminal_write_line(
+        "Expected: syscall validation passes and W^X process is terminated without a kernel panic"
+    );
+}
+
+static void print_capability(
+    uint64_t capabilities,
+    uint64_t capability,
+    const char *name
+)
+{
+    if ((capabilities & capability) != 0)
+    {
+        terminal_write(" ");
+        terminal_write(name);
+    }
+}
+
+static void command_whoami(
+    const char *arguments
+)
+{
+    (void)arguments;
+    terminal_write_line(
+        security_current_username()
+    );
+}
+
+static void command_id(
+    const char *arguments
+)
+{
+    (void)arguments;
+
+    char line[160];
+
+    ksnprintf(
+        line,
+        sizeof(line),
+        "uid=%u(%s) gid=%u capabilities=0x%llX",
+        (unsigned int)security_session_uid(),
+        security_current_username(),
+        (unsigned int)security_session_gid(),
+        (unsigned long long)
+            security_session_capabilities()
+    );
+
+    terminal_write_line(line);
+}
+
+static void command_users(
+    const char *arguments
+)
+{
+    (void)arguments;
+
+    for (
+        uint32_t index = 0;
+        index < security_user_count();
+        index++
+    )
+    {
+        security_user_info_t user;
+
+        if (!security_user_get(index, &user))
+        {
+            continue;
+        }
+
+        char line[128];
+
+        ksnprintf(
+            line,
+            sizeof(line),
+            "%s uid=%u gid=%u caps=0x%llX",
+            user.name,
+            (unsigned int)user.uid,
+            (unsigned int)user.gid,
+            (unsigned long long)
+                user.capabilities
+        );
+
+        terminal_write_line(line);
+    }
+}
+
+static void command_login(
+    const char *arguments
+)
+{
+    char name[SECURITY_USER_NAME_MAX + 1];
+    const char *password;
+
+    if (
+        !split_first_argument(
+            arguments,
+            name,
+            sizeof(name),
+            &password
+        ) ||
+        password[0] == '\0'
+    )
+    {
+        terminal_write_line(
+            "Usage: login USER PASSWORD"
+        );
+        return;
+    }
+
+    if (!security_login(name, password))
+    {
+        terminal_write_line("Login failed");
+        return;
+    }
+
+    gui_notify_session_changed();
+    terminal_write("Logged in as ");
+    terminal_write_line(
+        security_current_username()
+    );
+}
+
+static void command_logout(
+    const char *arguments
+)
+{
+    (void)arguments;
+    security_logout();
+    gui_notify_session_changed();
+    terminal_write_line(
+        "Guest session active"
+    );
+}
+
+static void command_caps(
+    const char *arguments
+)
+{
+    (void)arguments;
+
+    uint64_t capabilities =
+        security_session_capabilities();
+
+    terminal_write("Capabilities:");
+    print_capability(
+        capabilities,
+        SECURITY_CAP_FILE_ADMIN,
+        "file-admin"
+    );
+    print_capability(
+        capabilities,
+        SECURITY_CAP_PROCESS_ADMIN,
+        "process-admin"
+    );
+    print_capability(
+        capabilities,
+        SECURITY_CAP_SYSTEM_CONTROL,
+        "system-control"
+    );
+    print_capability(
+        capabilities,
+        SECURITY_CAP_USER_ADMIN,
+        "user-admin"
+    );
+    print_capability(
+        capabilities,
+        SECURITY_CAP_PROCESS_SPAWN,
+        "process-spawn"
+    );
+    print_capability(
+        capabilities,
+        SECURITY_CAP_NETWORK_USE,
+        "network-use"
+    );
+    terminal_write_line("");
+}
+
+static void command_stat(
+    const char *arguments
+)
+{
+    if (arguments[0] == '\0')
+    {
+        terminal_write_line("Usage: stat PATH");
+        return;
+    }
+
+    vfs_node_t *node = vfs_open(arguments);
+
+    if (node == NULL)
+    {
+        terminal_write_line("Path not found");
+        return;
+    }
+
+    char mode[4];
+    mode_to_string(node->mode, mode);
+
+    char line[180];
+
+    ksnprintf(
+        line,
+        sizeof(line),
+        "%s owner=%s uid=%u gid=%u mode=%s size=%llu",
+        node->type == VFS_NODE_DIRECTORY ?
+            "directory" : "file",
+        security_user_name(node->owner_uid),
+        (unsigned int)node->owner_uid,
+        (unsigned int)node->owner_gid,
+        mode,
+        (unsigned long long)node->size
+    );
+
+    terminal_write_line(line);
+}
+
+static void command_chmod(
+    const char *arguments
+)
+{
+    char mode_text[8];
+    const char *path;
+    uint16_t mode;
+
+    if (
+        !split_first_argument(
+            arguments,
+            mode_text,
+            sizeof(mode_text),
+            &path
+        ) ||
+        path[0] == '\0' ||
+        !parse_octal_mode(mode_text, &mode)
+    )
+    {
+        terminal_write_line(
+            "Usage: chmod MODE PATH"
+        );
+        return;
+    }
+
+    terminal_write_line(
+        vfs_chmod(path, mode) ?
+            "Mode changed" :
+            "Permission denied or path invalid"
+    );
+}
+
+static void command_chown(
+    const char *arguments
+)
+{
+    char name[SECURITY_USER_NAME_MAX + 1];
+    const char *path;
+    security_user_info_t user;
+
+    if (
+        !split_first_argument(
+            arguments,
+            name,
+            sizeof(name),
+            &path
+        ) ||
+        path[0] == '\0' ||
+        !security_find_user(name, &user)
+    )
+    {
+        terminal_write_line(
+            "Usage: chown USER PATH"
+        );
+        return;
+    }
+
+    terminal_write_line(
+        vfs_chown(path, user.uid, user.gid) ?
+            "Owner changed" :
+            "Permission denied or path invalid"
+    );
+}
+
+static void command_permtest(
+    const char *arguments
+)
+{
+    (void)arguments;
+
+    bool passed = true;
+    char byte = 0;
+
+    if (!security_login("user", "latteros"))
+    {
+        passed = false;
+    }
+
+    (void)vfs_remove("/home/.permtest", true);
+
+    if (
+        !vfs_write_text(
+            "/home/.permtest",
+            "private"
+        ) ||
+        !vfs_chmod(
+            "/home/.permtest",
+            0600U
+        )
+    )
+    {
+        passed = false;
+    }
+
+    vfs_node_t *node =
+        vfs_open("/home/.permtest");
+
+    if (
+        node == NULL ||
+        vfs_read(node, 0, &byte, 1) != 1
+    )
+    {
+        passed = false;
+    }
+
+    if (!security_login("guest", "guest"))
+    {
+        passed = false;
+    }
+
+    if (
+        node != NULL &&
+        vfs_read(node, 0, &byte, 1) != 0
+    )
+    {
+        passed = false;
+    }
+
+    if (
+        security_has_capability(
+            SECURITY_CAP_SYSTEM_CONTROL
+        ) ||
+        security_has_capability(
+            SECURITY_CAP_FILE_ADMIN
+        )
+    )
+    {
+        passed = false;
+    }
+
+    if (!security_login("root", "root"))
+    {
+        passed = false;
+    }
+
+    if (
+        node == NULL ||
+        vfs_read(node, 0, &byte, 1) != 1 ||
+        !vfs_remove("/home/.permtest", true)
+    )
+    {
+        passed = false;
+    }
+
+    (void)security_login("user", "latteros");
+    gui_notify_session_changed();
+
+    terminal_write_line(
+        passed ?
+            "Permission and capability tests: PASSED" :
+            "Permission and capability tests: FAILED"
+    );
 }
 
 static void command_mouse(
@@ -1792,6 +2833,22 @@ static void command_usb(
 {
     (void)arguments;
     usb_print_status();
+}
+
+static void command_usbms(
+    const char *arguments
+)
+{
+    (void)arguments;
+    usb_mass_storage_print();
+}
+
+static void command_fatinfo(
+    const char *arguments
+)
+{
+    (void)arguments;
+    fat_fs_print_status();
 }
 
 static void command_net(
@@ -2645,6 +3702,16 @@ static void command_reboot(
 {
     (void)arguments;
 
+    if (
+        !security_has_capability(
+            SECURITY_CAP_SYSTEM_CONTROL
+        )
+    )
+    {
+        terminal_write_line("Permission denied");
+        return;
+    }
+
     terminal_write_line("Restarting LatterOS...");
     power_reboot();
 }
@@ -2663,6 +3730,17 @@ static void command_shutdown(
 )
 {
     (void)arguments;
+
+    if (
+        !security_has_capability(
+            SECURITY_CAP_SYSTEM_CONTROL
+        )
+    )
+    {
+        terminal_write_line("Permission denied");
+        return;
+    }
+
     terminal_write_line("Shutting down...");
     power_shutdown();
 }

@@ -8,6 +8,7 @@ void gui_init(void);
 void gui_request_start(void);
 void gui_update(void);
 bool gui_is_active(void);
+void gui_notify_session_changed(void);
 
 typedef enum
 {

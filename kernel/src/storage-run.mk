@@ -12,6 +12,7 @@ run: $(DISK_IMAGE)
 	qemu-system-x86_64 \
 		-M pc,pcspk-audiodev=audio0 \
 		-cpu qemu64,+x2apic \
+		-smp 4 \
 		-m 2G \
 		-audiodev dsound,id=audio0 \
 		-serial file:latteros-serial.log \

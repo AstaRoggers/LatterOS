@@ -9,5 +9,6 @@ void pic_send_eoi(uint8_t irq);
 
 void pic_set_mask(uint8_t irq);
 void pic_clear_mask(uint8_t irq);
+void pic_mask_all(void);
 
 #endif

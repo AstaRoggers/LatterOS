@@ -70,6 +70,11 @@ void idt_init(void)
     idtr.base =
         (uint64_t)&idt[0];
 
+    idt_load();
+}
+
+void idt_load(void)
+{
     __asm__ volatile(
         "lidt %0"
         :
