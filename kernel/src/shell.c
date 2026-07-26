@@ -1,6 +1,9 @@
 #include "shell.h"
 
 #include "block_device.h"
+#include "kstdio.h"
+#include "kstdlib.h"
+#include "kstring.h"
 #include "pci.h"
 #include "process.h"
 #include "storage.h"
@@ -322,6 +325,10 @@ static void command_kill(
     const char *arguments
 );
 
+static void command_libtest(
+    const char *arguments
+);
+
 static void command_panic(
     const char *arguments
 );
@@ -426,6 +433,11 @@ static const shell_command_t commands[] = {
         "kill",
         "Terminate a process: kill PID",
         command_kill
+    },
+    {
+        "libtest",
+        "Test kernel string and formatting library",
+        command_libtest
     },
     {
         "panic",
@@ -1072,6 +1084,69 @@ static void command_kill(
 
     terminal_write_line(
         "Process terminated"
+    );
+}
+
+static void command_libtest(
+    const char *arguments
+)
+{
+    (void)arguments;
+
+    char copied[32];
+    char number[32];
+    char formatted[128];
+    int64_t parsed_value;
+
+    kstrcpy(copied, "LatterOS");
+
+    bool parsed =
+        kparse_i64(
+            "-2048",
+            &parsed_value
+        );
+
+    kitoa(
+        parsed_value,
+        number,
+        10
+    );
+
+    int formatted_length =
+        ksnprintf(
+            formatted,
+            sizeof(formatted),
+            "formatted: text=%s signed=%lld hex=%08X",
+            copied,
+            (long long)parsed_value,
+            0x2A
+        );
+
+    kprintf(
+        "strlen(\"%s\") = %zu\n",
+        copied,
+        kstrlen(copied)
+    );
+
+    kprintf(
+        "strcmp equal = %d\n",
+        kstrcmp(copied, "LatterOS")
+    );
+
+    kprintf(
+        "atoi result = %s (%s)\n",
+        number,
+        parsed ? "valid" : "invalid"
+    );
+
+    kprintf(
+        "%s\n",
+        formatted
+    );
+
+    kprintf(
+        "snprintf length = %d\n",
+        formatted_length
     );
 }
 
