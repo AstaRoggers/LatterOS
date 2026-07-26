@@ -26,10 +26,6 @@ void irq_unregister_handler(
 void irq_enable(void);
 void irq_disable(void);
 
-/*
- * Called by interrupt_stubs.S.
- * Do not call this function directly.
- */
 cpu_context_t *interrupt_dispatch(
     uint64_t vector,
     cpu_context_t *context

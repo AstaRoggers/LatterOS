@@ -4,6 +4,7 @@
 #include "panic.h"
 #include "pic.h"
 #include "process.h"
+#include "syscall.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -12,7 +13,8 @@
 #define IRQ_COUNT        16
 #define IRQ_VECTOR_BASE  32
 #define IRQ_VECTOR_END   47
-#define SCHEDULER_VECTOR 128
+#define SYSCALL_VECTOR   128
+#define SCHEDULER_VECTOR 129
 #define SPURIOUS_VECTOR  255
 
 static irq_handler_t irq_handlers[IRQ_COUNT];
@@ -104,6 +106,11 @@ cpu_context_t *interrupt_dispatch(
     if (vector == SPURIOUS_VECTOR)
     {
         return context;
+    }
+
+    if (vector == SYSCALL_VECTOR)
+    {
+        return syscall_dispatch(context);
     }
 
     if (vector == SCHEDULER_VECTOR)

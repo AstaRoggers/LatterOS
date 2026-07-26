@@ -24,7 +24,8 @@ typedef struct __attribute__((packed))
 
 void idt_set_gate(
     uint8_t vector,
-    void (*handler)(void)
+    void (*handler)(void),
+    uint8_t type_attributes
 );
 
 void idt_init(void);

@@ -314,6 +314,14 @@ static void command_spawn(
     const char *arguments
 );
 
+static void command_run(
+    const char *arguments
+);
+
+static void command_kill(
+    const char *arguments
+);
+
 static void command_panic(
     const char *arguments
 );
@@ -401,13 +409,23 @@ static const shell_command_t commands[] = {
     },
     {
         "ps",
-        "List kernel processes",
+        "List processes",
         command_ps
     },
     {
         "spawn",
         "Create a kernel worker thread",
         command_spawn
+    },
+    {
+        "run",
+        "Start a user program: run PATH",
+        command_run
+    },
+    {
+        "kill",
+        "Terminate a process: kill PID",
+        command_kill
     },
     {
         "panic",
@@ -996,6 +1014,65 @@ static void command_spawn(
             "Unable to create worker thread"
         );
     }
+}
+
+static void command_run(
+    const char *arguments
+)
+{
+    if (arguments[0] == '\0')
+    {
+        terminal_write_line(
+            "Usage: run PATH"
+        );
+        return;
+    }
+
+    uint64_t pid =
+        process_create_user_program(
+            arguments
+        );
+
+    if (pid == 0)
+    {
+        terminal_write_line(
+            "Unable to load user program"
+        );
+        return;
+    }
+
+    char pid_text[21];
+    uint64_to_string(pid, pid_text);
+
+    terminal_write("Started user process ");
+    terminal_write_line(pid_text);
+}
+
+static void command_kill(
+    const char *arguments
+)
+{
+    uint64_t pid;
+
+    if (!parse_uint64(arguments, &pid))
+    {
+        terminal_write_line(
+            "Usage: kill PID"
+        );
+        return;
+    }
+
+    if (!process_terminate(pid))
+    {
+        terminal_write_line(
+            "Unable to terminate process"
+        );
+        return;
+    }
+
+    terminal_write_line(
+        "Process terminated"
+    );
 }
 
 static void command_panic(

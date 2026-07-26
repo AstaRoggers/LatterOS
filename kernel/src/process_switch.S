@@ -8,10 +8,6 @@
 process_task_bootstrap:
     cld
 
-    /*
-     * The initial CPU context stores the thread entry in R12
-     * and its argument in R13.
-     */
     movq %r13, %rdi
     call *%r12
 

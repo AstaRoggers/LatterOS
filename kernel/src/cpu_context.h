@@ -30,4 +30,15 @@ typedef struct __attribute__((packed))
     uint64_t rflags;
 } cpu_context_t;
 
+/*
+ * The CPU pushes RSP and SS in addition to the normal interrupt frame
+ * whenever an interrupt crosses from ring 3 into ring 0.
+ */
+typedef struct __attribute__((packed))
+{
+    cpu_context_t base;
+    uint64_t rsp;
+    uint64_t ss;
+} cpu_user_context_t;
+
 #endif

@@ -6,6 +6,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
+extern const uint8_t user_hello_start[];
+extern const uint8_t user_hello_end[];
+extern const uint8_t user_spin_start[];
+extern const uint8_t user_spin_end[];
+
 #define RAMFS_FILE_CAPACITY 2048
 
 typedef struct
@@ -317,7 +322,63 @@ bool ramfs_init(void)
     if (
         !vfs_make_directory("/home") ||
         !vfs_make_directory("/etc") ||
-        !vfs_make_directory("/tmp")
+        !vfs_make_directory("/tmp") ||
+        !vfs_make_directory("/bin")
+    )
+    {
+        return false;
+    }
+
+
+    if (!vfs_create_file("/bin/hello"))
+    {
+        return false;
+    }
+
+    vfs_node_t *hello_program =
+        vfs_open("/bin/hello");
+
+    size_t hello_size =
+        (size_t)(
+            user_hello_end -
+            user_hello_start
+        );
+
+    if (
+        hello_program == NULL ||
+        vfs_write(
+            hello_program,
+            0,
+            user_hello_start,
+            hello_size
+        ) != hello_size
+    )
+    {
+        return false;
+    }
+
+    if (!vfs_create_file("/bin/spin"))
+    {
+        return false;
+    }
+
+    vfs_node_t *spin_program =
+        vfs_open("/bin/spin");
+
+    size_t spin_size =
+        (size_t)(
+            user_spin_end -
+            user_spin_start
+        );
+
+    if (
+        spin_program == NULL ||
+        vfs_write(
+            spin_program,
+            0,
+            user_spin_start,
+            spin_size
+        ) != spin_size
     )
     {
         return false;
