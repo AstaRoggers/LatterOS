@@ -15,9 +15,11 @@
 #include "pci.h"
 #include "physical_memory.h"
 #include "pic.h"
+#include "ramfs.h"
 #include "storage.h"
 #include "terminal.h"
 #include "timer.h"
+#include "vfs.h"
 
 __attribute__((used, section(".limine_requests")))
 static volatile uint64_t limine_base_revision[] =
@@ -199,6 +201,13 @@ void kmain(void)
     heap_init();
 
     if (!test_heap())
+    {
+        hcf();
+    }
+
+    vfs_init();
+
+    if (!ramfs_init())
     {
         hcf();
     }

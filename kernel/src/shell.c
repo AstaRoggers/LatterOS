@@ -5,6 +5,7 @@
 #include "storage.h"
 #include "terminal.h"
 #include "timer.h"
+#include "vfs.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -63,6 +64,69 @@ static bool character_is_space(
         character == ' ' ||
         character == '\t'
     );
+}
+
+static bool split_first_argument(
+    const char *arguments,
+    char *first,
+    size_t first_capacity,
+    const char **remaining
+)
+{
+    if (
+        arguments == NULL ||
+        first == NULL ||
+        first_capacity < 2 ||
+        remaining == NULL
+    )
+    {
+        return false;
+    }
+
+    size_t input = 0;
+
+    while (
+        character_is_space(
+            arguments[input]
+        )
+    )
+    {
+        input++;
+    }
+
+    size_t output = 0;
+
+    while (
+        arguments[input] != '\0' &&
+        !character_is_space(
+            arguments[input]
+        )
+    )
+    {
+        if (output + 1 >= first_capacity)
+        {
+            return false;
+        }
+
+        first[output] = arguments[input];
+        output++;
+        input++;
+    }
+
+    first[output] = '\0';
+
+    while (
+        character_is_space(
+            arguments[input]
+        )
+    )
+    {
+        input++;
+    }
+
+    *remaining = &arguments[input];
+
+    return output > 0;
 }
 
 static bool parse_uint64(
@@ -217,6 +281,30 @@ static void command_disktest(
     const char *arguments
 );
 
+static void command_ls(
+    const char *arguments
+);
+
+static void command_cd(
+    const char *arguments
+);
+
+static void command_pwd(
+    const char *arguments
+);
+
+static void command_cat(
+    const char *arguments
+);
+
+static void command_mkdir(
+    const char *arguments
+);
+
+static void command_write(
+    const char *arguments
+);
+
 static void command_panic(
     const char *arguments
 );
@@ -271,6 +359,36 @@ static const shell_command_t commands[] = {
         "disktest",
         "Test disk write and read",
         command_disktest
+    },
+    {
+        "ls",
+        "List files and directories",
+        command_ls
+    },
+    {
+        "cd",
+        "Change directory",
+        command_cd
+    },
+    {
+        "pwd",
+        "Show current directory",
+        command_pwd
+    },
+    {
+        "cat",
+        "Read a text file",
+        command_cat
+    },
+    {
+        "mkdir",
+        "Create a directory",
+        command_mkdir
+    },
+    {
+        "write",
+        "Write text: write PATH TEXT",
+        command_write
     },
     {
         "panic",
@@ -580,6 +698,256 @@ static void command_disktest(
 
     terminal_write_line(
         "Disk write/read test passed"
+    );
+}
+
+static void command_ls(
+    const char *arguments
+)
+{
+    const char *path =
+        arguments[0] == '\0' ?
+        "." :
+        arguments;
+
+    vfs_node_t *directory =
+        vfs_open(path);
+
+    if (directory == NULL)
+    {
+        terminal_write_line(
+            "Path not found"
+        );
+        return;
+    }
+
+    if (
+        directory->type !=
+        VFS_NODE_DIRECTORY
+    )
+    {
+        terminal_write_line(
+            "Not a directory"
+        );
+        return;
+    }
+
+    vfs_node_t *child =
+        directory->first_child;
+
+    if (child == NULL)
+    {
+        terminal_write_line("(empty)");
+        return;
+    }
+
+    while (child != NULL)
+    {
+        if (
+            child->type ==
+            VFS_NODE_DIRECTORY
+        )
+        {
+            terminal_write("[DIR]  ");
+        }
+        else
+        {
+            terminal_write("[FILE] ");
+        }
+
+        terminal_write(child->name);
+
+        if (
+            child->type ==
+            VFS_NODE_FILE
+        )
+        {
+            char size_text[21];
+
+            uint64_to_string(
+                child->size,
+                size_text
+            );
+
+            terminal_write(" (");
+            terminal_write(size_text);
+            terminal_write(" bytes)");
+        }
+
+        terminal_write_line("");
+
+        child = child->next_sibling;
+    }
+}
+
+static void command_cd(
+    const char *arguments
+)
+{
+    if (arguments[0] == '\0')
+    {
+        terminal_write_line(
+            "Usage: cd PATH"
+        );
+        return;
+    }
+
+    if (!vfs_change_directory(arguments))
+    {
+        terminal_write_line(
+            "Directory not found"
+        );
+    }
+}
+
+static void command_pwd(
+    const char *arguments
+)
+{
+    (void)arguments;
+
+    char path[VFS_PATH_MAX];
+
+    if (
+        !vfs_get_working_directory(
+            path,
+            sizeof(path)
+        )
+    )
+    {
+        terminal_write_line(
+            "Unable to resolve path"
+        );
+        return;
+    }
+
+    terminal_write_line(path);
+}
+
+static void command_cat(
+    const char *arguments
+)
+{
+    if (arguments[0] == '\0')
+    {
+        terminal_write_line(
+            "Usage: cat PATH"
+        );
+        return;
+    }
+
+    vfs_node_t *file =
+        vfs_open(arguments);
+
+    if (file == NULL)
+    {
+        terminal_write_line(
+            "File not found"
+        );
+        return;
+    }
+
+    if (file->type != VFS_NODE_FILE)
+    {
+        terminal_write_line(
+            "Not a file"
+        );
+        return;
+    }
+
+    char buffer[121];
+    size_t offset = 0;
+    char last_character = '\0';
+
+    while (offset < file->size)
+    {
+        size_t count =
+            vfs_read(
+                file,
+                offset,
+                buffer,
+                sizeof(buffer) - 1
+            );
+
+        if (count == 0)
+        {
+            break;
+        }
+
+        buffer[count] = '\0';
+        last_character =
+            buffer[count - 1];
+
+        terminal_write(buffer);
+        offset += count;
+    }
+
+    if (
+        file->size == 0 ||
+        last_character != '\n'
+    )
+    {
+        terminal_write_line("");
+    }
+}
+
+static void command_mkdir(
+    const char *arguments
+)
+{
+    if (arguments[0] == '\0')
+    {
+        terminal_write_line(
+            "Usage: mkdir PATH"
+        );
+        return;
+    }
+
+    if (!vfs_make_directory(arguments))
+    {
+        terminal_write_line(
+            "Unable to create directory"
+        );
+        return;
+    }
+
+    terminal_write_line(
+        "Directory created"
+    );
+}
+
+static void command_write(
+    const char *arguments
+)
+{
+    char path[VFS_PATH_MAX];
+    const char *text;
+
+    if (
+        !split_first_argument(
+            arguments,
+            path,
+            sizeof(path),
+            &text
+        )
+    )
+    {
+        terminal_write_line(
+            "Usage: write PATH TEXT"
+        );
+        return;
+    }
+
+    if (!vfs_write_text(path, text))
+    {
+        terminal_write_line(
+            "Unable to write file"
+        );
+        return;
+    }
+
+    terminal_write_line(
+        "File written"
     );
 }
 
