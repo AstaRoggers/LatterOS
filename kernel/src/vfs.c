@@ -1,9 +1,12 @@
 #include "vfs.h"
 
+#include "heap.h"
+
 #include <stddef.h>
 #include <stdint.h>
 
 #define VFS_MAX_COMPONENT_DEPTH 32
+#define VFS_COPY_BUFFER_SIZE 512
 
 static vfs_node_t *root_node;
 static vfs_node_t *current_directory;
@@ -48,6 +51,36 @@ static size_t string_length(const char *text)
     return length;
 }
 
+static bool copy_name(
+    char *destination,
+    const char *source
+)
+{
+    if (
+        destination == NULL ||
+        source == NULL
+    )
+    {
+        return false;
+    }
+
+    size_t index = 0;
+
+    while (source[index] != '\0')
+    {
+        if (index >= VFS_NAME_MAX)
+        {
+            return false;
+        }
+
+        destination[index] = source[index];
+        index++;
+    }
+
+    destination[index] = '\0';
+    return true;
+}
+
 static bool valid_name(const char *name)
 {
     if (
@@ -82,6 +115,81 @@ static bool valid_name(const char *name)
     }
 
     return length > 0;
+}
+
+static bool node_is_ancestor(
+    const vfs_node_t *ancestor,
+    const vfs_node_t *node
+)
+{
+    const vfs_node_t *cursor = node;
+
+    while (cursor != NULL)
+    {
+        if (cursor == ancestor)
+        {
+            return true;
+        }
+
+        cursor = cursor->parent;
+    }
+
+    return false;
+}
+
+static bool mounted_root(
+    const vfs_node_t *node
+)
+{
+    return (
+        node != NULL &&
+        node->parent != NULL &&
+        node->operations !=
+            node->parent->operations
+    );
+}
+
+static bool detach_child(
+    vfs_node_t *parent,
+    vfs_node_t *child
+)
+{
+    if (
+        parent == NULL ||
+        child == NULL
+    )
+    {
+        return false;
+    }
+
+    vfs_node_t *previous = NULL;
+    vfs_node_t *cursor =
+        parent->first_child;
+
+    while (cursor != NULL)
+    {
+        if (cursor == child)
+        {
+            if (previous == NULL)
+            {
+                parent->first_child =
+                    cursor->next_sibling;
+            }
+            else
+            {
+                previous->next_sibling =
+                    cursor->next_sibling;
+            }
+
+            cursor->next_sibling = NULL;
+            return true;
+        }
+
+        previous = cursor;
+        cursor = cursor->next_sibling;
+    }
+
+    return false;
 }
 
 void vfs_init(void)
@@ -339,16 +447,9 @@ static bool resolve_parent(
         return false;
     }
 
-    size_t name_length =
-        string_length(source_name);
-
-    for (
-        size_t index = 0;
-        index <= name_length;
-        index++
-    )
+    if (!copy_name(name, source_name))
     {
-        name[index] = source_name[index];
+        return false;
     }
 
     if (last_slash == 0)
@@ -369,6 +470,49 @@ static bool resolve_parent(
         *parent != NULL &&
         (*parent)->type ==
             VFS_NODE_DIRECTORY
+    );
+}
+
+bool vfs_mount_at(
+    const char *path,
+    vfs_node_t *filesystem_root
+)
+{
+    if (
+        root_node == NULL ||
+        current_directory == NULL ||
+        path == NULL ||
+        filesystem_root == NULL ||
+        filesystem_root->type !=
+            VFS_NODE_DIRECTORY
+    )
+    {
+        return false;
+    }
+
+    vfs_node_t *parent;
+    char name[VFS_NAME_MAX + 1];
+
+    if (
+        !resolve_parent(
+            path,
+            &parent,
+            name
+        ) ||
+        vfs_find_child(parent, name) != NULL
+    )
+    {
+        return false;
+    }
+
+    if (!copy_name(filesystem_root->name, name))
+    {
+        return false;
+    }
+
+    return vfs_add_child(
+        parent,
+        filesystem_root
     );
 }
 
@@ -447,6 +591,501 @@ bool vfs_make_directory(const char *path)
     return create_node(
         path,
         VFS_NODE_DIRECTORY
+    );
+}
+
+static bool remove_node_recursive(
+    vfs_node_t *node,
+    bool recursive
+)
+{
+    if (
+        node == NULL ||
+        node == root_node ||
+        mounted_root(node) ||
+        node_is_ancestor(
+            node,
+            current_directory
+        )
+    )
+    {
+        return false;
+    }
+
+    if (
+        node->type == VFS_NODE_DIRECTORY &&
+        node->first_child != NULL &&
+        !recursive
+    )
+    {
+        return false;
+    }
+
+    while (node->first_child != NULL)
+    {
+        if (
+            !remove_node_recursive(
+                node->first_child,
+                true
+            )
+        )
+        {
+            return false;
+        }
+    }
+
+    if (
+        node->operations == NULL ||
+        node->operations->remove == NULL ||
+        !node->operations->remove(node)
+    )
+    {
+        return false;
+    }
+
+    vfs_node_t *parent = node->parent;
+
+    if (
+        parent == NULL ||
+        !detach_child(parent, node)
+    )
+    {
+        return false;
+    }
+
+    kfree(node);
+    return true;
+}
+
+bool vfs_remove(
+    const char *path,
+    bool recursive
+)
+{
+    return remove_node_recursive(
+        vfs_open(path),
+        recursive
+    );
+}
+
+static bool move_node_same_filesystem(
+    vfs_node_t *node,
+    vfs_node_t *new_parent,
+    const char *new_name
+)
+{
+    if (
+        node == NULL ||
+        new_parent == NULL ||
+        !valid_name(new_name) ||
+        node == root_node ||
+        mounted_root(node) ||
+        node_is_ancestor(
+            node,
+            current_directory
+        ) ||
+        new_parent->type !=
+            VFS_NODE_DIRECTORY ||
+        node_is_ancestor(node, new_parent) ||
+        vfs_find_child(
+            new_parent,
+            new_name
+        ) != NULL ||
+        node->operations == NULL ||
+        node->operations !=
+            new_parent->operations ||
+        node->operations->move == NULL
+    )
+    {
+        return false;
+    }
+
+    if (
+        !node->operations->move(
+            node,
+            new_parent,
+            new_name
+        )
+    )
+    {
+        return false;
+    }
+
+    vfs_node_t *old_parent = node->parent;
+
+    if (
+        old_parent == NULL ||
+        !detach_child(old_parent, node)
+    )
+    {
+        return false;
+    }
+
+    if (!copy_name(node->name, new_name))
+    {
+        return false;
+    }
+
+    return vfs_add_child(
+        new_parent,
+        node
+    );
+}
+
+bool vfs_rename(
+    const char *path,
+    const char *new_name
+)
+{
+    vfs_node_t *node = vfs_open(path);
+
+    if (
+        node == NULL ||
+        node->parent == NULL ||
+        !valid_name(new_name)
+    )
+    {
+        return false;
+    }
+
+    if (strings_equal(node->name, new_name))
+    {
+        return true;
+    }
+
+    return move_node_same_filesystem(
+        node,
+        node->parent,
+        new_name
+    );
+}
+
+static bool copy_file_contents(
+    vfs_node_t *source,
+    vfs_node_t *destination
+)
+{
+    if (
+        source == NULL ||
+        destination == NULL ||
+        source->type != VFS_NODE_FILE ||
+        destination->type != VFS_NODE_FILE ||
+        destination->operations == NULL ||
+        destination->operations->truncate == NULL ||
+        !destination->operations->truncate(destination)
+    )
+    {
+        return false;
+    }
+
+    uint8_t buffer[VFS_COPY_BUFFER_SIZE];
+    size_t offset = 0;
+
+    while (offset < source->size)
+    {
+        size_t remaining =
+            source->size - offset;
+
+        size_t requested =
+            remaining < sizeof(buffer) ?
+            remaining : sizeof(buffer);
+
+        size_t count = vfs_read(
+            source,
+            offset,
+            buffer,
+            requested
+        );
+
+        if (count == 0)
+        {
+            return false;
+        }
+
+        if (
+            vfs_write(
+                destination,
+                offset,
+                buffer,
+                count
+            ) != count
+        )
+        {
+            return false;
+        }
+
+        offset += count;
+    }
+
+    return true;
+}
+
+static bool copy_node_into(
+    vfs_node_t *source,
+    vfs_node_t *destination_parent,
+    const char *destination_name
+)
+{
+    if (
+        source == NULL ||
+        destination_parent == NULL ||
+        !valid_name(destination_name) ||
+        destination_parent->type !=
+            VFS_NODE_DIRECTORY ||
+        destination_parent->operations == NULL ||
+        destination_parent->operations->create == NULL ||
+        vfs_find_child(
+            destination_parent,
+            destination_name
+        ) != NULL ||
+        (
+            source->type == VFS_NODE_DIRECTORY &&
+            node_is_ancestor(
+                source,
+                destination_parent
+            )
+        )
+    )
+    {
+        return false;
+    }
+
+    vfs_node_t *destination =
+        destination_parent->operations->create(
+            destination_parent,
+            destination_name,
+            source->type
+        );
+
+    if (destination == NULL)
+    {
+        return false;
+    }
+
+    bool success = true;
+
+    if (source->type == VFS_NODE_FILE)
+    {
+        success = copy_file_contents(
+            source,
+            destination
+        );
+    }
+    else
+    {
+        vfs_node_t *child =
+            source->first_child;
+
+        while (
+            success &&
+            child != NULL
+        )
+        {
+            success = copy_node_into(
+                child,
+                destination,
+                child->name
+            );
+
+            child = child->next_sibling;
+        }
+    }
+
+    if (!success)
+    {
+        (void)remove_node_recursive(
+            destination,
+            true
+        );
+    }
+
+    return success;
+}
+
+static bool destination_target(
+    vfs_node_t *source,
+    const char *destination_path,
+    vfs_node_t **parent,
+    char *name,
+    vfs_node_t **existing
+)
+{
+    if (
+        source == NULL ||
+        destination_path == NULL ||
+        parent == NULL ||
+        name == NULL ||
+        existing == NULL
+    )
+    {
+        return false;
+    }
+
+    *existing = vfs_open(destination_path);
+
+    if (*existing != NULL)
+    {
+        if (
+            (*existing)->type ==
+                VFS_NODE_DIRECTORY
+        )
+        {
+            *parent = *existing;
+            return copy_name(
+                name,
+                source->name
+            );
+        }
+
+        *parent = (*existing)->parent;
+        return copy_name(
+            name,
+            (*existing)->name
+        );
+    }
+
+    return resolve_parent(
+        destination_path,
+        parent,
+        name
+    );
+}
+
+bool vfs_copy(
+    const char *source_path,
+    const char *destination_path
+)
+{
+    vfs_node_t *source =
+        vfs_open(source_path);
+
+    if (
+        source == NULL ||
+        source == root_node ||
+        destination_path == NULL
+    )
+    {
+        return false;
+    }
+
+    vfs_node_t *parent;
+    vfs_node_t *existing;
+    char name[VFS_NAME_MAX + 1];
+
+    if (
+        !destination_target(
+            source,
+            destination_path,
+            &parent,
+            name,
+            &existing
+        )
+    )
+    {
+        return false;
+    }
+
+    if (
+        existing != NULL &&
+        existing->type == VFS_NODE_FILE
+    )
+    {
+        return (
+            source->type == VFS_NODE_FILE &&
+            existing != source &&
+            copy_file_contents(
+                source,
+                existing
+            )
+        );
+    }
+
+    return copy_node_into(
+        source,
+        parent,
+        name
+    );
+}
+
+bool vfs_move(
+    const char *source_path,
+    const char *destination_path
+)
+{
+    vfs_node_t *source =
+        vfs_open(source_path);
+
+    if (
+        source == NULL ||
+        source == root_node ||
+        mounted_root(source) ||
+        node_is_ancestor(
+            source,
+            current_directory
+        ) ||
+        destination_path == NULL
+    )
+    {
+        return false;
+    }
+
+    vfs_node_t *parent;
+    vfs_node_t *existing;
+    char name[VFS_NAME_MAX + 1];
+
+    if (
+        !destination_target(
+            source,
+            destination_path,
+            &parent,
+            name,
+            &existing
+        ) ||
+        (
+            existing != NULL &&
+            existing->type == VFS_NODE_FILE
+        )
+    )
+    {
+        return false;
+    }
+
+    if (
+        parent == source->parent &&
+        strings_equal(name, source->name)
+    )
+    {
+        return true;
+    }
+
+    if (
+        source->operations ==
+            parent->operations &&
+        source->operations != NULL &&
+        source->operations->move != NULL
+    )
+    {
+        return move_node_same_filesystem(
+            source,
+            parent,
+            name
+        );
+    }
+
+    if (
+        !copy_node_into(
+            source,
+            parent,
+            name
+        )
+    )
+    {
+        return false;
+    }
+
+    return remove_node_recursive(
+        source,
+        true
     );
 }
 
@@ -580,7 +1219,7 @@ bool vfs_get_working_directory(
         return true;
     }
 
-    const vfs_node_t *parts[
+    const vfs_node_t *components[
         VFS_MAX_COMPONENT_DEPTH
     ];
 
@@ -593,53 +1232,52 @@ bool vfs_get_working_directory(
         node != root_node
     )
     {
-        if (
-            depth >=
-            VFS_MAX_COMPONENT_DEPTH
-        )
+        if (depth >= VFS_MAX_COMPONENT_DEPTH)
         {
             return false;
         }
 
-        parts[depth] = node;
+        components[depth] = node;
         depth++;
         node = node->parent;
     }
 
     size_t output = 0;
-    buffer[output] = '/';
-    output++;
+    buffer[output++] = '/';
 
-    while (depth > 0)
+    for (
+        size_t index = depth;
+        index > 0;
+        index--
+    )
     {
-        depth--;
-
         const char *name =
-            parts[depth]->name;
+            components[index - 1]->name;
 
-        size_t index = 0;
+        size_t length =
+            string_length(name);
 
-        while (name[index] != '\0')
+        if (
+            output + length + 1 >
+            capacity
+        )
         {
-            if (output + 1 >= capacity)
-            {
-                return false;
-            }
-
-            buffer[output] = name[index];
-            output++;
-            index++;
+            return false;
         }
 
-        if (depth > 0)
+        for (
+            size_t character = 0;
+            character < length;
+            character++
+        )
         {
-            if (output + 1 >= capacity)
-            {
-                return false;
-            }
+            buffer[output++] =
+                name[character];
+        }
 
-            buffer[output] = '/';
-            output++;
+        if (index > 1)
+        {
+            buffer[output++] = '/';
         }
     }
 

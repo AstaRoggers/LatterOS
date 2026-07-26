@@ -54,7 +54,8 @@ static uint64_t *table_from_entry(
 static uint64_t *next_table(
     uint64_t *table,
     uint16_t index,
-    bool create
+    bool create,
+    bool user
 )
 {
     uint64_t entry = table[index];
@@ -66,9 +67,12 @@ static uint64_t *next_table(
             return NULL;
         }
 
-        table[index] |=
-            PAGE_WRITABLE |
-            PAGE_USER;
+        table[index] |= PAGE_WRITABLE;
+
+        if (user)
+        {
+            table[index] |= PAGE_USER;
+        }
 
         return table_from_entry(
             table[index]
@@ -80,8 +84,7 @@ static uint64_t *next_table(
         return NULL;
     }
 
-    void *physical_page =
-        alloc_page();
+    void *physical_page = alloc_page();
 
     if (physical_page == NULL)
     {
@@ -95,20 +98,28 @@ static uint64_t *next_table(
 
     clear_page(new_table);
 
+    uint64_t flags =
+        PAGE_PRESENT |
+        PAGE_WRITABLE;
+
+    if (user)
+    {
+        flags |= PAGE_USER;
+    }
+
     table[index] =
         ((uint64_t)physical_page &
             PAGE_ADDRESS_MASK) |
-        PAGE_PRESENT |
-        PAGE_WRITABLE |
-        PAGE_USER;
+        flags;
 
     return new_table;
 }
 
-bool paging_map_user_page(
+static bool map_page(
     uint64_t virtual_address,
     uint64_t physical_address,
-    bool writable
+    bool writable,
+    bool user
 )
 {
     if (
@@ -131,18 +142,17 @@ bool paging_map_user_page(
     uint16_t pt_index =
         (uint16_t)((virtual_address >> 12) & 0x1FF);
 
-    uint64_t cr3 = read_cr3();
-
     uint64_t *pml4 =
         physical_to_virtual(
-            cr3 & PAGE_ADDRESS_MASK
+            read_cr3() & PAGE_ADDRESS_MASK
         );
 
     uint64_t *pdpt =
         next_table(
             pml4,
             pml4_index,
-            true
+            true,
+            user
         );
 
     if (pdpt == NULL)
@@ -154,7 +164,8 @@ bool paging_map_user_page(
         next_table(
             pdpt,
             pdpt_index,
-            true
+            true,
+            user
         );
 
     if (pd == NULL)
@@ -166,7 +177,8 @@ bool paging_map_user_page(
         next_table(
             pd,
             pd_index,
-            true
+            true,
+            user
         );
 
     if (pt == NULL)
@@ -179,13 +191,16 @@ bool paging_map_user_page(
         return false;
     }
 
-    uint64_t flags =
-        PAGE_PRESENT |
-        PAGE_USER;
+    uint64_t flags = PAGE_PRESENT;
 
     if (writable)
     {
         flags |= PAGE_WRITABLE;
+    }
+
+    if (user)
+    {
+        flags |= PAGE_USER;
     }
 
     pt[pt_index] =
@@ -202,17 +217,38 @@ bool paging_map_user_page(
     return true;
 }
 
-bool paging_unmap_page(
+bool paging_map_user_page(
+    uint64_t virtual_address,
+    uint64_t physical_address,
+    bool writable
+)
+{
+    return map_page(
+        virtual_address,
+        physical_address,
+        writable,
+        true
+    );
+}
+
+bool paging_map_kernel_page(
+    uint64_t virtual_address,
+    uint64_t physical_address,
+    bool writable
+)
+{
+    return map_page(
+        virtual_address,
+        physical_address,
+        writable,
+        false
+    );
+}
+
+static uint64_t *page_table_entry(
     uint64_t virtual_address
 )
 {
-    if (
-        (virtual_address & (PAGE_SIZE - 1)) != 0
-    )
-    {
-        return false;
-    }
-
     uint16_t pml4_index =
         (uint16_t)((virtual_address >> 39) & 0x1FF);
 
@@ -225,53 +261,76 @@ bool paging_unmap_page(
     uint16_t pt_index =
         (uint16_t)((virtual_address >> 12) & 0x1FF);
 
-    uint64_t cr3 = read_cr3();
-
     uint64_t *pml4 =
         physical_to_virtual(
-            cr3 & PAGE_ADDRESS_MASK
+            read_cr3() & PAGE_ADDRESS_MASK
         );
 
     uint64_t *pdpt =
         next_table(
             pml4,
             pml4_index,
+            false,
             false
         );
 
     if (pdpt == NULL)
     {
-        return false;
+        return NULL;
     }
 
     uint64_t *pd =
         next_table(
             pdpt,
             pdpt_index,
+            false,
             false
         );
 
     if (pd == NULL)
     {
-        return false;
+        return NULL;
     }
 
     uint64_t *pt =
         next_table(
             pd,
             pd_index,
+            false,
             false
         );
 
+    if (pt == NULL)
+    {
+        return NULL;
+    }
+
+    return &pt[pt_index];
+}
+
+bool paging_unmap_page(
+    uint64_t virtual_address
+)
+{
     if (
-        pt == NULL ||
-        !(pt[pt_index] & PAGE_PRESENT)
+        (virtual_address & (PAGE_SIZE - 1)) != 0
     )
     {
         return false;
     }
 
-    pt[pt_index] = 0;
+    uint64_t *entry =
+        page_table_entry(virtual_address);
+
+    if (
+        entry == NULL ||
+        !(*entry & PAGE_PRESENT)
+    )
+    {
+        return false;
+    }
+
+    *entry = 0;
 
     __asm__ volatile(
         "invlpg (%0)"
@@ -281,4 +340,20 @@ bool paging_unmap_page(
     );
 
     return true;
+}
+
+bool paging_is_mapped(
+    uint64_t virtual_address
+)
+{
+    uint64_t *entry =
+        page_table_entry(
+            virtual_address &
+            ~(uint64_t)(PAGE_SIZE - 1)
+        );
+
+    return (
+        entry != NULL &&
+        (*entry & PAGE_PRESENT) != 0
+    );
 }

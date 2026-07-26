@@ -1,3 +1,5 @@
+#include "gui.h"
+#include "heap.h"
 #include "shell.h"
 
 #include "arp.h"
@@ -5,16 +7,23 @@
 #include "dhcp.h"
 #include "dns.h"
 #include "kstdio.h"
+#include "klog.h"
 #include "kstdlib.h"
 #include "kstring.h"
 #include "icmp.h"
 #include "ipv4.h"
+#include "latteros_fs.h"
 #include "mouse.h"
 #include "network.h"
+#include "page_allocator.h"
+#include "physical_memory.h"
 #include "pci.h"
 #include "process.h"
+#include "power.h"
 #include "rtc.h"
 #include "serial.h"
+#include "selftest.h"
+#include "stacktrace.h"
 #include "speaker.h"
 #include "storage.h"
 #include "tcp.h"
@@ -322,6 +331,22 @@ static void command_write(
     const char *arguments
 );
 
+static void command_rm(
+    const char *arguments
+);
+
+static void command_rename(
+    const char *arguments
+);
+
+static void command_cp(
+    const char *arguments
+);
+
+static void command_mv(
+    const char *arguments
+);
+
 static void command_ps(
     const char *arguments
 );
@@ -403,6 +428,70 @@ static void command_tcp(
 );
 
 static void command_http(
+    const char *arguments
+);
+
+static void command_fsinfo(
+    const char *arguments
+);
+
+static void command_sync(
+    const char *arguments
+);
+
+static void command_dmesg(
+    const char *arguments
+);
+
+static void command_logtest(
+    const char *arguments
+);
+
+static void command_sysinfo(
+    const char *arguments
+);
+
+static void command_trace(
+    const char *arguments
+);
+
+static void command_meminfo(
+    const char *arguments
+);
+
+static void command_memtest(
+    const char *arguments
+);
+
+static void command_guardtest(
+    const char *arguments
+);
+
+static void command_schedtest(
+    const char *arguments
+);
+
+static void command_schedstatus(
+    const char *arguments
+);
+
+static void command_fstest(
+    const char *arguments
+);
+
+static void command_nettest(
+    const char *arguments
+);
+
+static void command_reboot(
+    const char *arguments
+);
+
+static void command_gui(
+    const char *arguments
+);
+
+static void command_shutdown(
     const char *arguments
 );
 
@@ -490,6 +579,26 @@ static const shell_command_t commands[] = {
         "write",
         "Write text: write PATH TEXT",
         command_write
+    },
+    {
+        "rm",
+        "Delete file/directory: rm PATH",
+        command_rm
+    },
+    {
+        "rename",
+        "Rename: rename PATH NEW_NAME",
+        command_rename
+    },
+    {
+        "cp",
+        "Copy: cp SOURCE DESTINATION",
+        command_cp
+    },
+    {
+        "mv",
+        "Move: mv SOURCE DESTINATION",
+        command_mv
     },
     {
         "ps",
@@ -595,6 +704,86 @@ static const shell_command_t commands[] = {
         "http",
         "Fetch HTTP page: http HOST [PATH]",
         command_http
+    },
+    {
+        "fsinfo",
+        "Show persistent filesystem status",
+        command_fsinfo
+    },
+    {
+        "sync",
+        "Flush persistent filesystem metadata",
+        command_sync
+    },
+    {
+        "dmesg",
+        "Show kernel log: dmesg [LEVEL|clear]",
+        command_dmesg
+    },
+    {
+        "logtest",
+        "Write test messages to the kernel log",
+        command_logtest
+    },
+    {
+        "sysinfo",
+        "Show system health and resource status",
+        command_sysinfo
+    },
+    {
+        "trace",
+        "Print the current kernel stack trace",
+        command_trace
+    },
+    {
+        "meminfo",
+        "Show heap tracking: meminfo [leaks]",
+        command_meminfo
+    },
+    {
+        "memtest",
+        "Run heap tracking and integrity tests",
+        command_memtest
+    },
+    {
+        "guardtest",
+        "Validate process stack guard pages",
+        command_guardtest
+    },
+    {
+        "schedtest",
+        "Start scheduler stress workers",
+        command_schedtest
+    },
+    {
+        "schedstatus",
+        "Show scheduler stress progress",
+        command_schedstatus
+    },
+    {
+        "fstest",
+        "Run persistent filesystem tests",
+        command_fstest
+    },
+    {
+        "nettest",
+        "Run ARP, ICMP, DNS, UDP, and TCP tests",
+        command_nettest
+    },
+    {
+        "reboot",
+        "Restart LatterOS",
+        command_reboot
+    },
+    {
+        "gui",
+        "Launch the graphical desktop",
+        command_gui
+    },
+    {
+        "shutdown",
+        "Shut down LatterOS",
+        command_shutdown
     },
     {
         "panic",
@@ -1154,6 +1343,115 @@ static void command_write(
 
     terminal_write_line(
         "File written"
+    );
+}
+
+static void command_rm(
+    const char *arguments
+)
+{
+    if (arguments[0] == '\0')
+    {
+        terminal_write_line(
+            "Usage: rm PATH"
+        );
+        return;
+    }
+
+    terminal_write_line(
+        vfs_remove(arguments, true) ?
+            "Removed" :
+            "Unable to remove path"
+    );
+}
+
+static void command_rename(
+    const char *arguments
+)
+{
+    char path[VFS_PATH_MAX];
+    const char *new_name;
+
+    if (
+        !split_first_argument(
+            arguments,
+            path,
+            sizeof(path),
+            &new_name
+        ) ||
+        new_name[0] == '\0'
+    )
+    {
+        terminal_write_line(
+            "Usage: rename PATH NEW_NAME"
+        );
+        return;
+    }
+
+    terminal_write_line(
+        vfs_rename(path, new_name) ?
+            "Renamed" :
+            "Unable to rename path"
+    );
+}
+
+static void command_cp(
+    const char *arguments
+)
+{
+    char source[VFS_PATH_MAX];
+    const char *destination;
+
+    if (
+        !split_first_argument(
+            arguments,
+            source,
+            sizeof(source),
+            &destination
+        ) ||
+        destination[0] == '\0'
+    )
+    {
+        terminal_write_line(
+            "Usage: cp SOURCE DESTINATION"
+        );
+        return;
+    }
+
+    terminal_write_line(
+        vfs_copy(source, destination) ?
+            "Copied" :
+            "Unable to copy path"
+    );
+}
+
+static void command_mv(
+    const char *arguments
+)
+{
+    char source[VFS_PATH_MAX];
+    const char *destination;
+
+    if (
+        !split_first_argument(
+            arguments,
+            source,
+            sizeof(source),
+            &destination
+        ) ||
+        destination[0] == '\0'
+    )
+    {
+        terminal_write_line(
+            "Usage: mv SOURCE DESTINATION"
+        );
+        return;
+    }
+
+    terminal_write_line(
+        vfs_move(source, destination) ?
+            "Moved" :
+            "Unable to move path"
     );
 }
 
@@ -2047,6 +2345,326 @@ static void command_http(
     );
 
     tcp_close(1500);
+}
+
+static void command_fsinfo(
+    const char *arguments
+)
+{
+    (void)arguments;
+    latteros_fs_print_info();
+}
+
+static void command_sync(
+    const char *arguments
+)
+{
+    (void)arguments;
+
+    terminal_write_line(
+        latteros_fs_sync() ?
+            "Persistent filesystem synchronized" :
+            "Persistent filesystem unavailable"
+    );
+}
+
+static bool parse_log_level(
+    const char *text,
+    klog_level_t *level
+)
+{
+    if (
+        text == NULL ||
+        level == NULL
+    )
+    {
+        return false;
+    }
+
+    if (strings_equal(text, "debug"))
+    {
+        *level = KLOG_DEBUG;
+        return true;
+    }
+
+    if (strings_equal(text, "info"))
+    {
+        *level = KLOG_INFO;
+        return true;
+    }
+
+    if (
+        strings_equal(text, "warn") ||
+        strings_equal(text, "warning")
+    )
+    {
+        *level = KLOG_WARNING;
+        return true;
+    }
+
+    if (strings_equal(text, "error"))
+    {
+        *level = KLOG_ERROR;
+        return true;
+    }
+
+    if (strings_equal(text, "panic"))
+    {
+        *level = KLOG_PANIC;
+        return true;
+    }
+
+    return false;
+}
+
+static void command_dmesg(
+    const char *arguments
+)
+{
+    while (
+        arguments != NULL &&
+        character_is_space(*arguments)
+    )
+    {
+        arguments++;
+    }
+
+    if (
+        arguments != NULL &&
+        strings_equal(arguments, "clear")
+    )
+    {
+        klog_clear();
+        terminal_write_line("Kernel log cleared");
+        return;
+    }
+
+    klog_level_t level = KLOG_DEBUG;
+
+    if (
+        arguments != NULL &&
+        arguments[0] != '\0' &&
+        !parse_log_level(arguments, &level)
+    )
+    {
+        terminal_write_line(
+            "Usage: dmesg [debug|info|warn|error|panic|clear]"
+        );
+
+        return;
+    }
+
+    klog_print(level);
+}
+
+static void command_logtest(
+    const char *arguments
+)
+{
+    (void)arguments;
+
+    klog_write(KLOG_DEBUG, "test", "Debug log message");
+    klog_write(KLOG_INFO, "test", "Information log message");
+    klog_write(KLOG_WARNING, "test", "Warning log message");
+    klog_write(KLOG_ERROR, "test", "Error log message");
+
+    terminal_write_line(
+        "Test messages written; run dmesg"
+    );
+}
+
+static void command_sysinfo(
+    const char *arguments
+)
+{
+    (void)arguments;
+
+    uint32_t frequency = timer_frequency();
+    uint64_t uptime_seconds =
+        frequency == 0 ?
+        0 :
+        timer_ticks() / frequency;
+
+    kprintf("LatterOS version 0.1\n");
+    kprintf(
+        "Uptime: %llu seconds\n",
+        (unsigned long long)uptime_seconds
+    );
+    kprintf(
+        "Memory: total=%llu MiB usable=%llu MiB free-pages=%llu\n",
+        (unsigned long long)(
+            physical_memory_total_bytes() /
+            (1024ULL * 1024ULL)
+        ),
+        (unsigned long long)(
+            physical_memory_usable_bytes() /
+            (1024ULL * 1024ULL)
+        ),
+        (unsigned long long)free_page_count()
+    );
+    kprintf(
+        "Processes: %u\n",
+        (unsigned int)process_count()
+    );
+
+    heap_stats_t heap_stats;
+    heap_get_stats(&heap_stats);
+
+    kprintf(
+        "Heap: active=%llu bytes=%llu peak=%llu pages=%llu\n",
+        (unsigned long long)heap_stats.active_allocations,
+        (unsigned long long)heap_stats.active_bytes,
+        (unsigned long long)heap_stats.peak_active_bytes,
+        (unsigned long long)heap_stats.heap_pages
+    );
+    kprintf(
+        "Filesystem: %s entries=%u used=%llu/%llu bytes\n",
+        latteros_fs_is_mounted() ?
+            "mounted" : "fallback",
+        (unsigned int)latteros_fs_entry_count(),
+        (unsigned long long)latteros_fs_used_bytes(),
+        (unsigned long long)latteros_fs_capacity_bytes()
+    );
+    kprintf(
+        "Network: %s link=%s rx=%llu tx=%llu\n",
+        network_is_ready() ? "ready" : "offline",
+        network_link_up() ? "up" : "down",
+        (unsigned long long)network_received_frames(),
+        (unsigned long long)network_transmitted_frames()
+    );
+    kprintf(
+        "Serial: %s  Kernel log entries: %u\n",
+        serial_is_available() ? "ready" : "unavailable",
+        (unsigned int)klog_entry_count()
+    );
+}
+
+static void command_trace(
+    const char *arguments
+)
+{
+    (void)arguments;
+    stacktrace_print_current();
+}
+
+static void command_meminfo(
+    const char *arguments
+)
+{
+    heap_print_stats();
+
+    if (strings_equal(arguments, "leaks"))
+    {
+        heap_print_allocations(32);
+    }
+}
+
+static void command_memtest(
+    const char *arguments
+)
+{
+    (void)arguments;
+    (void)selftest_memory();
+}
+
+static void command_guardtest(
+    const char *arguments
+)
+{
+    (void)arguments;
+    (void)selftest_guard_pages();
+}
+
+static void command_schedtest(
+    const char *arguments
+)
+{
+    uint64_t workers = 6;
+
+    if (
+        arguments[0] != '\0' &&
+        (
+            !parse_uint64(arguments, &workers) ||
+            workers == 0 ||
+            workers > 8
+        )
+    )
+    {
+        terminal_write_line(
+            "Usage: schedtest [1-8]"
+        );
+        return;
+    }
+
+    if (
+        !selftest_scheduler_start(
+            (uint32_t)workers,
+            750000ULL
+        )
+    )
+    {
+        terminal_write_line(
+            "Unable to start scheduler stress test"
+        );
+        return;
+    }
+
+    kprintf(
+        "Scheduler stress started with %llu workers. Run schedstatus.\n",
+        (unsigned long long)workers
+    );
+}
+
+static void command_schedstatus(
+    const char *arguments
+)
+{
+    (void)arguments;
+    selftest_scheduler_print_status();
+}
+
+static void command_fstest(
+    const char *arguments
+)
+{
+    (void)arguments;
+    (void)selftest_filesystem();
+}
+
+static void command_nettest(
+    const char *arguments
+)
+{
+    (void)arguments;
+    (void)selftest_network();
+}
+
+static void command_reboot(
+    const char *arguments
+)
+{
+    (void)arguments;
+
+    terminal_write_line("Restarting LatterOS...");
+    power_reboot();
+}
+
+static void command_gui(
+    const char *arguments
+)
+{
+    (void)arguments;
+
+    gui_request_start();
+}
+
+static void command_shutdown(
+    const char *arguments
+)
+{
+    (void)arguments;
+    terminal_write_line("Shutting down...");
+    power_shutdown();
 }
 
 static void command_panic(

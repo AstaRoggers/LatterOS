@@ -122,9 +122,9 @@ cpu_context_t *interrupt_dispatch(
 
     if (vector < IRQ_VECTOR_BASE)
     {
-        kernel_panic(
+        kernel_panic_context(
             "Unhandled CPU exception",
-            vector
+            context
         );
 
         return context;
@@ -163,9 +163,9 @@ cpu_context_t *interrupt_dispatch(
         return context;
     }
 
-    kernel_panic(
+    kernel_panic_context(
         "Unhandled interrupt vector",
-        vector
+        context
     );
 
     return context;

@@ -7,12 +7,14 @@ $(DISK_IMAGE):
 	dd if=/dev/zero of=$(DISK_IMAGE) bs=1M count=16
 
 run: $(DISK_IMAGE)
-	$(MAKE) -f GNUmakefile TOOLCHAIN=llvm
+	$(MAKE) -f GNUmakefile TOOLCHAIN=llvm CFLAGS="-g -O2 -pipe -fno-omit-frame-pointer"
+	rm -f latteros-serial.log
 	qemu-system-x86_64 \
 		-M pc,pcspk-audiodev=audio0 \
 		-cpu qemu64,+x2apic \
 		-m 2G \
 		-audiodev dsound,id=audio0 \
+		-serial file:latteros-serial.log \
 		-usb \
 		-device usb-tablet \
 		-nic none \

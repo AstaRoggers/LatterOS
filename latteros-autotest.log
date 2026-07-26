@@ -1,0 +1,25 @@
+[000001] INFO boot: LatterOS starting; framebuffer=1280x800 pitch=5120 serial=ready
+[000002] INFO cpu: GDT and IDT initialized
+[000003] INFO memory: usable=2083484 KiB pages=520871 free=262143
+[000004] INFO process: Process scheduler initialized
+[000005] INFO pci: devices=7 storage=detected
+[000006] INFO filesystem: LatterOS filesystem mounted; entries=2 used=44 bytes
+[000007] INFO usb: controller=ready
+[000008] INFO network: RTL8139 and IPv4 stack initialized
+[000009] INFO interrupts: x2APIC=enabled
+[000010] INFO timer: PIT configured at 100 Hz
+[000011] INFO autotest: AUTOTEST: BEGIN
+[000012] INFO selftest: memory tracking passed
+[000013] INFO autotest: AUTOTEST: MEMORY PASS
+[000014] INFO selftest: filesystem passed
+[000015] INFO autotest: AUTOTEST: FILESYSTEM PASS
+[000016] INFO selftest: scheduler stress started workers=8 iterations=750000
+[000017] INFO autotest: AUTOTEST: SCHEDULER_START PASS
+[000018] INFO selftest: guard pages passed guarded=8
+[000019] INFO autotest: AUTOTEST: GUARD_PAGES PASS
+[000020] INFO selftest: scheduler stress completed workers=8
+[000021] INFO autotest: AUTOTEST: SCHEDULER PASS
+[000022] INFO selftest: network passed arp=1 ping=1 dns=1 udp=1 tcp=1
+[000023] INFO autotest: AUTOTEST: NETWORK PASS
+[000024] INFO autotest: AUTOTEST: PASS
+[000025] INFO power: Shutdown requested

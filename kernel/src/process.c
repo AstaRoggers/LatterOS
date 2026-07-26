@@ -21,6 +21,13 @@
 #define USER_CODE_OFFSET     0x0000000000000000ULL
 #define USER_STACK_OFFSET    0x0000000000200000ULL
 
+#define KERNEL_STACK_REGION_BASE \
+    0xFFFFFE0000000000ULL
+#define KERNEL_STACK_STRIDE \
+    (PAGE_SIZE * 3ULL)
+#define KERNEL_STACK_GUARD_OFFSET 0ULL
+#define KERNEL_STACK_PAGE_OFFSET  PAGE_SIZE
+
 extern void process_task_bootstrap(void);
 
 static process_t processes[PROCESS_MAX_COUNT];
@@ -32,6 +39,57 @@ static bool initialized;
 static volatile uint64_t demo_counters[
     PROCESS_MAX_COUNT
 ];
+
+static uint64_t interrupt_save_and_disable(void)
+{
+    uint64_t flags;
+
+    __asm__ volatile(
+        "pushfq\n"
+        "popq %0\n"
+        "cli"
+        : "=r"(flags)
+        :
+        : "memory"
+    );
+
+    return flags;
+}
+
+static void interrupt_restore(uint64_t flags)
+{
+    if (flags & (1ULL << 9))
+    {
+        __asm__ volatile(
+            "sti"
+            :
+            :
+            : "memory"
+        );
+    }
+}
+
+static uint64_t kernel_guard_for_slot(
+    uint32_t slot
+)
+{
+    return
+        KERNEL_STACK_REGION_BASE +
+        (uint64_t)slot *
+            KERNEL_STACK_STRIDE +
+        KERNEL_STACK_GUARD_OFFSET;
+}
+
+static uint64_t kernel_stack_for_slot(
+    uint32_t slot
+)
+{
+    return
+        KERNEL_STACK_REGION_BASE +
+        (uint64_t)slot *
+            KERNEL_STACK_STRIDE +
+        KERNEL_STACK_PAGE_OFFSET;
+}
 
 static void clear_bytes(
     void *pointer,
@@ -142,6 +200,13 @@ static void destroy_process_slot(
         }
     }
 
+    if (process->kernel_stack_virtual != 0)
+    {
+        (void)paging_unmap_page(
+            process->kernel_stack_virtual
+        );
+    }
+
     if (process->kernel_stack_page != NULL)
     {
         free_page(
@@ -196,58 +261,69 @@ static int32_t find_free_slot(void)
 }
 
 static cpu_context_t *create_kernel_context(
-    void *physical_stack_page,
+    uint64_t stack_virtual,
     kernel_thread_entry_t entry,
     void *argument
 )
 {
     uint8_t *stack_base =
-        physical_to_virtual(
-            (uint64_t)physical_stack_page
-        );
+        (uint8_t *)stack_virtual;
 
     uint8_t *stack_top =
         stack_base + PAGE_SIZE;
 
-    cpu_context_t *context =
-        (cpu_context_t *)(
+    /*
+     * Reserve a complete five-word IRETQ tail even for a ring-0
+     * thread. A same-privilege IRETQ consumes only RIP, CS, and
+     * RFLAGS, leaving RSP sixteen bytes below the page boundary.
+     *
+     * Keeping the two extra words inside the mapped stack page
+     * prevents IRETQ from touching the unmapped page immediately
+     * above a newly created guarded stack.
+     */
+    cpu_user_context_t *frame =
+        (cpu_user_context_t *)(
             stack_top -
-            sizeof(cpu_context_t)
+            sizeof(cpu_user_context_t)
         );
 
     clear_bytes(
-        context,
-        sizeof(cpu_context_t)
+        frame,
+        sizeof(cpu_user_context_t)
     );
 
-    context->r12 =
+    frame->base.r12 =
         (uint64_t)entry;
 
-    context->r13 =
+    frame->base.r13 =
         (uint64_t)argument;
 
-    context->rip =
+    frame->base.rip =
         (uint64_t)process_task_bootstrap;
 
-    context->cs =
+    frame->base.cs =
         GDT_KERNEL_CODE_SELECTOR;
 
-    context->rflags =
+    frame->base.rflags =
         INITIAL_RFLAGS;
 
-    return context;
+    frame->rsp =
+        (uint64_t)stack_top;
+
+    frame->ss =
+        GDT_KERNEL_DATA_SELECTOR;
+
+    return &frame->base;
 }
 
 static cpu_context_t *create_user_context(
-    void *physical_kernel_stack,
+    uint64_t kernel_stack_virtual,
     uint64_t code_virtual,
     uint64_t stack_virtual
 )
 {
     uint8_t *kernel_stack_base =
-        physical_to_virtual(
-            (uint64_t)physical_kernel_stack
-        );
+        (uint8_t *)kernel_stack_virtual;
 
     uint8_t *kernel_stack_top =
         kernel_stack_base + PAGE_SIZE;
@@ -540,21 +616,50 @@ bool process_create_kernel_thread(
         return false;
     }
 
-    irq_disable();
+    uint64_t interrupt_flags =
+        interrupt_save_and_disable();
+
+    bool created = false;
+    void *kernel_stack_page = NULL;
 
     int32_t slot = find_free_slot();
 
     if (slot < 0)
     {
-        return false;
+        goto finish;
     }
 
-    void *kernel_stack_page =
-        alloc_page();
+    kernel_stack_page = alloc_page();
 
     if (kernel_stack_page == NULL)
     {
-        return false;
+        goto finish;
+    }
+
+    uint64_t kernel_guard =
+        kernel_guard_for_slot(
+            (uint32_t)slot
+        );
+
+    uint64_t kernel_stack_virtual =
+        kernel_stack_for_slot(
+            (uint32_t)slot
+        );
+
+    (void)paging_unmap_page(kernel_guard);
+    (void)paging_unmap_page(kernel_stack_virtual);
+
+    if (
+        !paging_map_kernel_page(
+            kernel_stack_virtual,
+            (uint64_t)kernel_stack_page,
+            true
+        )
+    )
+    {
+        free_page(kernel_stack_page);
+        kernel_stack_page = NULL;
+        goto finish;
     }
 
     process_t *process =
@@ -569,19 +674,27 @@ bool process_create_kernel_thread(
     process->kernel_stack_page =
         kernel_stack_page;
 
+    process->kernel_stack_virtual =
+        kernel_stack_virtual;
+
+    process->kernel_stack_guard =
+        kernel_guard;
+
     process->kernel_stack_top =
-        (uint64_t)physical_to_virtual(
-            (uint64_t)kernel_stack_page
-        ) + PAGE_SIZE;
+        kernel_stack_virtual + PAGE_SIZE;
 
     process->context =
         create_kernel_context(
-            kernel_stack_page,
+            kernel_stack_virtual,
             entry,
             argument
         );
 
-    return true;
+    created = true;
+
+finish:
+    interrupt_restore(interrupt_flags);
+    return created;
 }
 
 bool process_spawn_demo_thread(void)
@@ -661,18 +774,30 @@ uint64_t process_create_user_program(
         return 0;
     }
 
-    irq_disable();
+    uint64_t interrupt_flags =
+        interrupt_save_and_disable();
+
+    uint64_t pid = 0;
+    void *kernel_stack_page = NULL;
+    void *user_code_page = NULL;
+    void *user_stack_page = NULL;
+    uint64_t kernel_stack_virtual = 0;
+    uint64_t code_virtual = 0;
+    uint64_t stack_virtual = 0;
+    bool kernel_stack_mapped = false;
+    bool code_mapped = false;
+    bool stack_mapped = false;
 
     int32_t slot = find_free_slot();
 
     if (slot < 0)
     {
-        return 0;
+        goto finish;
     }
 
-    void *kernel_stack_page = alloc_page();
-    void *user_code_page = alloc_page();
-    void *user_stack_page = alloc_page();
+    kernel_stack_page = alloc_page();
+    user_code_page = alloc_page();
+    user_stack_page = alloc_page();
 
     if (
         kernel_stack_page == NULL ||
@@ -680,22 +805,7 @@ uint64_t process_create_user_program(
         user_stack_page == NULL
     )
     {
-        if (kernel_stack_page != NULL)
-        {
-            free_page(kernel_stack_page);
-        }
-
-        if (user_code_page != NULL)
-        {
-            free_page(user_code_page);
-        }
-
-        if (user_stack_page != NULL)
-        {
-            free_page(user_stack_page);
-        }
-
-        return 0;
+        goto finish;
     }
 
     uint64_t region_base =
@@ -703,13 +813,16 @@ uint64_t process_create_user_program(
         (uint64_t)slot *
             USER_REGION_STRIDE;
 
-    uint64_t code_virtual =
+    code_virtual =
         region_base +
         USER_CODE_OFFSET;
 
-    uint64_t stack_virtual =
+    uint64_t stack_guard =
         region_base +
         USER_STACK_OFFSET;
+
+    stack_virtual =
+        stack_guard + PAGE_SIZE;
 
     clear_bytes(
         physical_to_virtual(
@@ -725,6 +838,34 @@ uint64_t process_create_user_program(
         PAGE_SIZE
     );
 
+    uint64_t kernel_guard =
+        kernel_guard_for_slot(
+            (uint32_t)slot
+        );
+
+    kernel_stack_virtual =
+        kernel_stack_for_slot(
+            (uint32_t)slot
+        );
+
+    (void)paging_unmap_page(kernel_guard);
+    (void)paging_unmap_page(kernel_stack_virtual);
+    (void)paging_unmap_page(stack_guard);
+    (void)paging_unmap_page(stack_virtual);
+
+    if (
+        !paging_map_kernel_page(
+            kernel_stack_virtual,
+            (uint64_t)kernel_stack_page,
+            true
+        )
+    )
+    {
+        goto finish;
+    }
+
+    kernel_stack_mapped = true;
+
     if (
         vfs_read(
             file,
@@ -736,10 +877,7 @@ uint64_t process_create_user_program(
         ) != file->size
     )
     {
-        free_page(kernel_stack_page);
-        free_page(user_code_page);
-        free_page(user_stack_page);
-        return 0;
+        goto finish;
     }
 
     if (
@@ -750,11 +888,10 @@ uint64_t process_create_user_program(
         )
     )
     {
-        free_page(kernel_stack_page);
-        free_page(user_code_page);
-        free_page(user_stack_page);
-        return 0;
+        goto finish;
     }
+
+    code_mapped = true;
 
     if (
         !paging_map_user_page(
@@ -764,12 +901,10 @@ uint64_t process_create_user_program(
         )
     )
     {
-        paging_unmap_page(code_virtual);
-        free_page(kernel_stack_page);
-        free_page(user_code_page);
-        free_page(user_stack_page);
-        return 0;
+        goto finish;
     }
+
+    stack_mapped = true;
 
     process_t *process =
         &processes[slot];
@@ -787,10 +922,14 @@ uint64_t process_create_user_program(
     process->kernel_stack_page =
         kernel_stack_page;
 
+    process->kernel_stack_virtual =
+        kernel_stack_virtual;
+
+    process->kernel_stack_guard =
+        kernel_guard;
+
     process->kernel_stack_top =
-        (uint64_t)physical_to_virtual(
-            (uint64_t)kernel_stack_page
-        ) + PAGE_SIZE;
+        kernel_stack_virtual + PAGE_SIZE;
 
     process->user_code_page =
         user_code_page;
@@ -804,17 +943,63 @@ uint64_t process_create_user_program(
     process->user_stack_virtual =
         stack_virtual;
 
+    process->user_stack_guard =
+        stack_guard;
+
     process->user_code_size =
         file->size;
 
     process->context =
         create_user_context(
-            kernel_stack_page,
+            kernel_stack_virtual,
             code_virtual,
             stack_virtual
         );
 
-    return process->pid;
+    pid = process->pid;
+
+finish:
+    if (pid == 0)
+    {
+        if (stack_mapped)
+        {
+            (void)paging_unmap_page(
+                stack_virtual
+            );
+        }
+
+        if (code_mapped)
+        {
+            (void)paging_unmap_page(
+                code_virtual
+            );
+        }
+
+        if (kernel_stack_mapped)
+        {
+            (void)paging_unmap_page(
+                kernel_stack_virtual
+            );
+        }
+
+        if (kernel_stack_page != NULL)
+        {
+            free_page(kernel_stack_page);
+        }
+
+        if (user_code_page != NULL)
+        {
+            free_page(user_code_page);
+        }
+
+        if (user_stack_page != NULL)
+        {
+            free_page(user_stack_page);
+        }
+    }
+
+    interrupt_restore(interrupt_flags);
+    return pid;
 }
 
 bool process_terminate(uint64_t pid)
@@ -827,7 +1012,17 @@ bool process_terminate(uint64_t pid)
         return false;
     }
 
+    uint64_t flags;
+
+    __asm__ volatile(
+        "pushfq\n"
+        "popq %0"
+        : "=r"(flags)
+    );
+
     irq_disable();
+
+    bool terminated = false;
 
     for (
         uint32_t slot = 1;
@@ -846,19 +1041,24 @@ bool process_terminate(uint64_t pid)
             continue;
         }
 
-        if (slot == current_index)
+        if (slot != current_index)
         {
-            return false;
+            process->state =
+                PROCESS_TERMINATED;
+
+            destroy_process_slot(slot);
+            terminated = true;
         }
 
-        process->state =
-            PROCESS_TERMINATED;
-
-        destroy_process_slot(slot);
-        return true;
+        break;
     }
 
-    return false;
+    if (flags & (1ULL << 9))
+    {
+        irq_enable();
+    }
+
+    return terminated;
 }
 
 cpu_context_t *process_schedule_on_timer(
@@ -1099,3 +1299,79 @@ void process_print_all(void)
         );
     }
 }
+
+uint32_t process_guarded_stack_count(void)
+{
+    uint32_t count = 0;
+
+    for (
+        uint32_t index = 1;
+        index < PROCESS_MAX_COUNT;
+        index++
+    )
+    {
+        const process_t *process =
+            &processes[index];
+
+        if (
+            process->state != PROCESS_UNUSED &&
+            process->kernel_stack_virtual != 0
+        )
+        {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+bool process_guard_pages_validate(void)
+{
+    for (
+        uint32_t index = 1;
+        index < PROCESS_MAX_COUNT;
+        index++
+    )
+    {
+        const process_t *process =
+            &processes[index];
+
+        if (process->state == PROCESS_UNUSED)
+        {
+            continue;
+        }
+
+        if (
+            process->kernel_stack_virtual == 0 ||
+            process->kernel_stack_guard == 0 ||
+            paging_is_mapped(
+                process->kernel_stack_guard
+            ) ||
+            !paging_is_mapped(
+                process->kernel_stack_virtual
+            )
+        )
+        {
+            return false;
+        }
+
+        if (
+            process->mode == PROCESS_USER &&
+            (
+                process->user_stack_guard == 0 ||
+                paging_is_mapped(
+                    process->user_stack_guard
+                ) ||
+                !paging_is_mapped(
+                    process->user_stack_virtual
+                )
+            )
+        )
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+

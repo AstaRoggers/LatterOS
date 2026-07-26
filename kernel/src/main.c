@@ -3,11 +3,13 @@
 #include <stdint.h>
 #include <limine.h>
 
+#include "autotest.h"
 #include "dhcp.h"
 #include "dns.h"
 #include "ethernet.h"
 #include "gdt.h"
 #include "graphics.h"
+#include "gui.h"
 #include "heap.h"
 #include "hhdm.h"
 #include "icmp.h"
@@ -15,6 +17,8 @@
 #include "irq.h"
 #include "ipv4.h"
 #include "keyboard.h"
+#include "klog.h"
+#include "latteros_fs.h"
 #include "lapic.h"
 #include "mouse.h"
 #include "network.h"
@@ -199,10 +203,27 @@ void kmain(void)
 
     graphics_clear(0x0066CC);
 
-    serial_init();
+    bool serial_ready = serial_init();
+
+    klog_init();
+    klogf(
+        KLOG_INFO,
+        "boot",
+        "LatterOS starting; framebuffer=%ux%u pitch=%llu serial=%s",
+        (unsigned int)framebuffer->width,
+        (unsigned int)framebuffer->height,
+        (unsigned long long)framebuffer->pitch,
+        serial_ready ? "ready" : "unavailable"
+    );
 
     gdt_init();
     idt_init();
+
+    klog_write(
+        KLOG_INFO,
+        "cpu",
+        "GDT and IDT initialized"
+    );
 
     hhdm_init(
         hhdm_request.response
@@ -217,23 +238,108 @@ void kmain(void)
 
     if (!test_heap())
     {
+        klog_write(
+            KLOG_PANIC,
+            "memory",
+            "Heap self-test failed"
+        );
+
         hcf();
     }
 
+    klogf(
+        KLOG_INFO,
+        "memory",
+        "usable=%llu KiB pages=%llu free=%llu",
+        (unsigned long long)(
+            physical_memory_usable_bytes() / 1024ULL
+        ),
+        (unsigned long long)
+            physical_memory_usable_pages(),
+        (unsigned long long)free_page_count()
+    );
+
     process_init();
+
+    klog_write(
+        KLOG_INFO,
+        "process",
+        "Process scheduler initialized"
+    );
+
+    pci_init();
+    storage_init();
+
+    klogf(
+        KLOG_INFO,
+        "pci",
+        "devices=%u storage=%s",
+        (unsigned int)pci_device_count(),
+        storage_controller_found() ?
+            "detected" : "not detected"
+    );
 
     vfs_init();
 
     if (!ramfs_init())
     {
+        klog_write(
+            KLOG_PANIC,
+            "filesystem",
+            "RAM filesystem initialization failed"
+        );
+
         hcf();
     }
 
-    pci_init();
-    storage_init();
-    (void)usb_init();
+    if (!latteros_fs_init())
+    {
+        klog_write(
+            KLOG_WARNING,
+            "filesystem",
+            "Persistent /home unavailable; using RAM fallback"
+        );
 
-    if (network_init())
+        if (
+            !vfs_make_directory("/home") ||
+            !vfs_write_text(
+                "/home/welcome.txt",
+                "Persistent storage unavailable; using RAM home.\n"
+            )
+        )
+        {
+            klog_write(
+                KLOG_PANIC,
+                "filesystem",
+                "Unable to create fallback /home"
+            );
+
+            hcf();
+        }
+    }
+    else
+    {
+        klogf(
+            KLOG_INFO,
+            "filesystem",
+            "LatterOS filesystem mounted; entries=%u used=%llu bytes",
+            (unsigned int)latteros_fs_entry_count(),
+            (unsigned long long)latteros_fs_used_bytes()
+        );
+    }
+
+    bool usb_ready = usb_init();
+
+    klogf(
+        usb_ready ? KLOG_INFO : KLOG_WARNING,
+        "usb",
+        "controller=%s",
+        usb_ready ? "ready" : "not detected"
+    );
+
+    bool network_ready = network_init();
+
+    if (network_ready)
     {
         ethernet_init();
 
@@ -252,6 +358,20 @@ void kmain(void)
         );
 
         icmp_init();
+
+        klog_write(
+            KLOG_INFO,
+            "network",
+            "RTL8139 and IPv4 stack initialized"
+        );
+    }
+    else
+    {
+        klog_write(
+            KLOG_WARNING,
+            "network",
+            "Network card not available"
+        );
     }
 
     terminal_init();
@@ -266,6 +386,13 @@ void kmain(void)
         lapic_ready
     );
 
+    klogf(
+        lapic_ready ? KLOG_INFO : KLOG_WARNING,
+        "interrupts",
+        "x2APIC=%s",
+        lapic_ready ? "enabled" : "unavailable"
+    );
+
     keyboard_init();
 
     irq_register_handler(
@@ -274,15 +401,40 @@ void kmain(void)
     );
 
     (void)mouse_init();
+    gui_init();
     speaker_init();
 
     timer_init(100);
 
+    klog_write(
+        KLOG_INFO,
+        "timer",
+        "PIT configured at 100 Hz"
+    );
+
     irq_enable();
+
+#ifdef LATTEROS_AUTOTEST
+    autotest_start();
+#else
+    gui_request_start();
+
+    klog_write(
+        KLOG_INFO,
+        "desktop",
+        "Desktop startup requested"
+    );
+#endif
 
     for (;;)
     {
         network_poll();
+
+#ifdef LATTEROS_AUTOTEST
+        autotest_update();
+#else
+        gui_update();
+#endif
 
         __asm__ volatile(
             "hlt"

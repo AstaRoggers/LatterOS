@@ -46,12 +46,15 @@ typedef struct
     cpu_context_t *context;
 
     void *kernel_stack_page;
+    uint64_t kernel_stack_virtual;
+    uint64_t kernel_stack_guard;
     uint64_t kernel_stack_top;
 
     void *user_code_page;
     void *user_stack_page;
     uint64_t user_code_virtual;
     uint64_t user_stack_virtual;
+    uint64_t user_stack_guard;
     size_t user_code_size;
 
     process_file_t files[PROCESS_MAX_FILES];
@@ -102,5 +105,8 @@ const process_t *process_get(uint32_t index);
 const process_t *process_current(void);
 
 void process_print_all(void);
+
+bool process_guard_pages_validate(void);
+uint32_t process_guarded_stack_count(void);
 
 #endif

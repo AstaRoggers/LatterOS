@@ -1,7 +1,9 @@
 #include "terminal.h"
+
 #include "graphics.h"
 #include "shell.h"
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define TERMINAL_X 100
@@ -15,7 +17,6 @@
 #define LINE_HEIGHT 12
 
 #define PROMPT "> "
-
 #define COMMAND_BUFFER_SIZE 128
 
 static uint32_t cursor_x;
@@ -24,11 +25,18 @@ static uint32_t cursor_y;
 static char command_buffer[COMMAND_BUFFER_SIZE];
 static uint32_t command_length;
 
+static terminal_output_handler_t redirect_output;
+static terminal_clear_handler_t redirect_clear;
+
 static void terminal_clear_command_buffer(void)
 {
-    for (uint32_t i = 0; i < COMMAND_BUFFER_SIZE; i++)
+    for (
+        uint32_t index = 0;
+        index < COMMAND_BUFFER_SIZE;
+        index++
+    )
     {
-        command_buffer[i] = '\0';
+        command_buffer[index] = '\0';
     }
 
     command_length = 0;
@@ -50,18 +58,48 @@ static void terminal_draw_header(void)
     terminal_write_line("LatterOS v0.1");
 }
 
+void terminal_set_redirect(
+    terminal_output_handler_t output_handler,
+    terminal_clear_handler_t clear_handler
+)
+{
+    redirect_output = output_handler;
+    redirect_clear = clear_handler;
+}
+
+void terminal_clear_redirect(void)
+{
+    redirect_output = NULL;
+    redirect_clear = NULL;
+}
+
 void terminal_write(const char *text)
 {
-    for (uint32_t i = 0; text[i] != '\0'; i++)
+    if (text == NULL)
     {
-        if (text[i] == '\n')
+        return;
+    }
+
+    if (redirect_output != NULL)
+    {
+        redirect_output(text);
+        return;
+    }
+
+    for (
+        uint32_t index = 0;
+        text[index] != '\0';
+        index++
+    )
+    {
+        if (text[index] == '\n')
         {
             terminal_new_line();
             continue;
         }
 
         draw_character(
-            text[i],
+            text[index],
             cursor_x,
             cursor_y,
             TERMINAL_FOREGROUND
@@ -73,12 +111,29 @@ void terminal_write(const char *text)
 
 void terminal_write_line(const char *text)
 {
+    if (redirect_output != NULL)
+    {
+        if (text != NULL)
+        {
+            redirect_output(text);
+        }
+
+        redirect_output("\n");
+        return;
+    }
+
     terminal_write(text);
     terminal_new_line();
 }
 
 void terminal_clear(void)
 {
+    if (redirect_clear != NULL)
+    {
+        redirect_clear();
+        return;
+    }
+
     graphics_clear(TERMINAL_BACKGROUND);
 
     cursor_x = TERMINAL_X;
@@ -89,6 +144,8 @@ void terminal_clear(void)
 
 void terminal_init(void)
 {
+    terminal_clear_redirect();
+
     cursor_x = TERMINAL_X;
     cursor_y = TERMINAL_Y;
 

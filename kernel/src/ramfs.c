@@ -45,11 +45,23 @@ static vfs_node_t *ramfs_create(
     vfs_node_type_t type
 );
 
+static bool ramfs_remove(
+    vfs_node_t *node
+);
+
+static bool ramfs_move(
+    vfs_node_t *node,
+    vfs_node_t *new_parent,
+    const char *new_name
+);
+
 static const vfs_operations_t ramfs_operations = {
     .read = ramfs_read,
     .write = ramfs_write,
     .truncate = ramfs_truncate,
-    .create = ramfs_create
+    .create = ramfs_create,
+    .remove = ramfs_remove,
+    .move = ramfs_move
 };
 
 static void clear_bytes(
@@ -305,6 +317,45 @@ static vfs_node_t *ramfs_create(
     return node;
 }
 
+
+static bool ramfs_remove(
+    vfs_node_t *node
+)
+{
+    if (node == NULL)
+    {
+        return false;
+    }
+
+    if (
+        node->type == VFS_NODE_FILE &&
+        node->filesystem_data != NULL
+    )
+    {
+        ramfs_file_data_t *file_data =
+            node->filesystem_data;
+
+        kfree(file_data->data);
+        kfree(file_data);
+        node->filesystem_data = NULL;
+    }
+
+    return true;
+}
+
+static bool ramfs_move(
+    vfs_node_t *node,
+    vfs_node_t *new_parent,
+    const char *new_name
+)
+{
+    return (
+        node != NULL &&
+        new_parent != NULL &&
+        new_name != NULL
+    );
+}
+
 bool ramfs_init(void)
 {
     vfs_node_t *root =
@@ -322,7 +373,6 @@ bool ramfs_init(void)
     }
 
     if (
-        !vfs_make_directory("/home") ||
         !vfs_make_directory("/etc") ||
         !vfs_make_directory("/tmp") ||
         !vfs_make_directory("/bin")
@@ -418,16 +468,6 @@ bool ramfs_init(void)
             "/README",
             "Welcome to the LatterOS RAM filesystem.\n"
             "Use ls, cd, pwd, cat, mkdir, and write.\n"
-        )
-    )
-    {
-        return false;
-    }
-
-    if (
-        !vfs_write_text(
-            "/home/welcome.txt",
-            "Your LatterOS filesystem is working.\n"
         )
     )
     {
