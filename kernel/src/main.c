@@ -3,23 +3,35 @@
 #include <stdint.h>
 #include <limine.h>
 
+#include "dhcp.h"
+#include "dns.h"
+#include "ethernet.h"
 #include "gdt.h"
 #include "graphics.h"
 #include "heap.h"
 #include "hhdm.h"
+#include "icmp.h"
 #include "idt.h"
 #include "irq.h"
+#include "ipv4.h"
 #include "keyboard.h"
 #include "lapic.h"
+#include "mouse.h"
+#include "network.h"
 #include "page_allocator.h"
 #include "pci.h"
 #include "physical_memory.h"
 #include "pic.h"
 #include "process.h"
 #include "ramfs.h"
+#include "serial.h"
+#include "speaker.h"
 #include "storage.h"
+#include "tcp.h"
 #include "terminal.h"
 #include "timer.h"
+#include "udp.h"
+#include "usb.h"
 #include "vfs.h"
 
 __attribute__((used, section(".limine_requests")))
@@ -187,6 +199,8 @@ void kmain(void)
 
     graphics_clear(0x0066CC);
 
+    serial_init();
+
     gdt_init();
     idt_init();
 
@@ -217,6 +231,28 @@ void kmain(void)
 
     pci_init();
     storage_init();
+    (void)usb_init();
+
+    if (network_init())
+    {
+        ethernet_init();
+
+        ipv4_init(
+            IPV4_ADDRESS(10, 0, 2, 15),
+            IPV4_ADDRESS(255, 255, 255, 0),
+            IPV4_ADDRESS(10, 0, 2, 2)
+        );
+
+        udp_init();
+        tcp_init();
+        dhcp_init();
+
+        dns_init(
+            IPV4_ADDRESS(10, 0, 2, 3)
+        );
+
+        icmp_init();
+    }
 
     terminal_init();
 
@@ -237,12 +273,17 @@ void kmain(void)
         keyboard_irq_handler
     );
 
+    (void)mouse_init();
+    speaker_init();
+
     timer_init(100);
 
     irq_enable();
 
     for (;;)
     {
+        network_poll();
+
         __asm__ volatile(
             "hlt"
             :

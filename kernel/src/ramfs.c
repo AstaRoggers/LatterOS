@@ -10,6 +10,8 @@ extern const uint8_t user_hello_start[];
 extern const uint8_t user_hello_end[];
 extern const uint8_t user_spin_start[];
 extern const uint8_t user_spin_end[];
+extern const uint8_t user_apitest_start[];
+extern const uint8_t user_apitest_end[];
 
 #define RAMFS_FILE_CAPACITY 2048
 
@@ -379,6 +381,33 @@ bool ramfs_init(void)
             user_spin_start,
             spin_size
         ) != spin_size
+    )
+    {
+        return false;
+    }
+
+    if (!vfs_create_file("/bin/apitest"))
+    {
+        return false;
+    }
+
+    vfs_node_t *apitest_program =
+        vfs_open("/bin/apitest");
+
+    size_t apitest_size =
+        (size_t)(
+            user_apitest_end -
+            user_apitest_start
+        );
+
+    if (
+        apitest_program == NULL ||
+        vfs_write(
+            apitest_program,
+            0,
+            user_apitest_start,
+            apitest_size
+        ) != apitest_size
     )
     {
         return false;

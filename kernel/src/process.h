@@ -2,6 +2,7 @@
 #define PROCESS_H
 
 #include "cpu_context.h"
+#include "vfs.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -9,6 +10,7 @@
 
 #define PROCESS_NAME_LENGTH 32
 #define PROCESS_MAX_COUNT   16
+#define PROCESS_MAX_FILES   8
 
 typedef enum
 {
@@ -28,6 +30,14 @@ typedef void (*kernel_thread_entry_t)(void *argument);
 
 typedef struct
 {
+    bool used;
+    vfs_node_t *node;
+    size_t offset;
+    uint32_t flags;
+} process_file_t;
+
+typedef struct
+{
     uint64_t pid;
     char name[PROCESS_NAME_LENGTH];
     process_state_t state;
@@ -43,6 +53,8 @@ typedef struct
     uint64_t user_code_virtual;
     uint64_t user_stack_virtual;
     size_t user_code_size;
+
+    process_file_t files[PROCESS_MAX_FILES];
 
     int64_t exit_status;
     uint64_t cpu_ticks;

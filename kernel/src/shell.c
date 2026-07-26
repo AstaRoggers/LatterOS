@@ -1,14 +1,27 @@
 #include "shell.h"
 
+#include "arp.h"
 #include "block_device.h"
+#include "dhcp.h"
+#include "dns.h"
 #include "kstdio.h"
 #include "kstdlib.h"
 #include "kstring.h"
+#include "icmp.h"
+#include "ipv4.h"
+#include "mouse.h"
+#include "network.h"
 #include "pci.h"
 #include "process.h"
+#include "rtc.h"
+#include "serial.h"
+#include "speaker.h"
 #include "storage.h"
+#include "tcp.h"
 #include "terminal.h"
 #include "timer.h"
+#include "udp.h"
+#include "usb.h"
 #include "vfs.h"
 
 #include <stdbool.h>
@@ -329,6 +342,70 @@ static void command_libtest(
     const char *arguments
 );
 
+static void command_apitest(
+    const char *arguments
+);
+
+static void command_mouse(
+    const char *arguments
+);
+
+static void command_beep(
+    const char *arguments
+);
+
+static void command_date(
+    const char *arguments
+);
+
+static void command_serialtest(
+    const char *arguments
+);
+
+static void command_usb(
+    const char *arguments
+);
+
+static void command_net(
+    const char *arguments
+);
+
+static void command_netsend(
+    const char *arguments
+);
+
+static void command_ifconfig(
+    const char *arguments
+);
+
+static void command_arp(
+    const char *arguments
+);
+
+static void command_ping(
+    const char *arguments
+);
+
+static void command_udp(
+    const char *arguments
+);
+
+static void command_dhcp(
+    const char *arguments
+);
+
+static void command_dns(
+    const char *arguments
+);
+
+static void command_tcp(
+    const char *arguments
+);
+
+static void command_http(
+    const char *arguments
+);
+
 static void command_panic(
     const char *arguments
 );
@@ -438,6 +515,86 @@ static const shell_command_t commands[] = {
         "libtest",
         "Test kernel string and formatting library",
         command_libtest
+    },
+    {
+        "apitest",
+        "Test user runtime file and process APIs",
+        command_apitest
+    },
+    {
+        "mouse",
+        "Show PS/2 mouse state",
+        command_mouse
+    },
+    {
+        "beep",
+        "PC speaker: beep [Hz] [ms]",
+        command_beep
+    },
+    {
+        "date",
+        "Show the RTC date and time",
+        command_date
+    },
+    {
+        "serialtest",
+        "Test the COM1 serial driver",
+        command_serialtest
+    },
+    {
+        "usb",
+        "Show USB host controller status",
+        command_usb
+    },
+    {
+        "net",
+        "Show network card status",
+        command_net
+    },
+    {
+        "netsend",
+        "Transmit a raw Ethernet test frame",
+        command_netsend
+    },
+    {
+        "ifconfig",
+        "Show IPv4 configuration",
+        command_ifconfig
+    },
+    {
+        "arp",
+        "Resolve or show ARP entries",
+        command_arp
+    },
+    {
+        "ping",
+        "Send ICMP echo: ping IPv4",
+        command_ping
+    },
+    {
+        "udp",
+        "Show UDP transport status",
+        command_udp
+    },
+    {
+        "dhcp",
+        "Request and show a DHCP lease",
+        command_dhcp
+    },
+    {
+        "dns",
+        "Resolve an A record: dns NAME",
+        command_dns
+    },
+    {
+        "tcp",
+        "Test TCP connection: tcp HOST [PORT]",
+        command_tcp
+    },
+    {
+        "http",
+        "Fetch HTTP page: http HOST [PATH]",
+        command_http
     },
     {
         "panic",
@@ -1148,6 +1305,748 @@ static void command_libtest(
         "snprintf length = %d\n",
         formatted_length
     );
+}
+
+static void command_apitest(
+    const char *arguments
+)
+{
+    (void)arguments;
+
+    uint64_t pid =
+        process_create_user_program(
+            "/bin/apitest"
+        );
+
+    if (pid == 0)
+    {
+        terminal_write_line(
+            "Unable to start API test"
+        );
+        return;
+    }
+
+    char pid_text[21];
+    uint64_to_string(pid, pid_text);
+
+    terminal_write("Started API test process ");
+    terminal_write_line(pid_text);
+}
+
+static void command_mouse(
+    const char *arguments
+)
+{
+    (void)arguments;
+
+    if (!mouse_is_available())
+    {
+        terminal_write_line(
+            "PS/2 mouse is unavailable"
+        );
+        return;
+    }
+
+    mouse_state_t state;
+    mouse_get_state(&state);
+
+    kprintf(
+        "Mouse x=%d y=%d packets=%llu left=%s right=%s middle=%s\n",
+        state.x,
+        state.y,
+        (unsigned long long)state.packet_count,
+        state.left_button ? "down" : "up",
+        state.right_button ? "down" : "up",
+        state.middle_button ? "down" : "up"
+    );
+}
+
+static void command_beep(
+    const char *arguments
+)
+{
+    uint64_t frequency = 440;
+    uint64_t duration = 250;
+
+    if (arguments[0] != '\0')
+    {
+        char frequency_text[21];
+        const char *remaining;
+
+        if (
+            !split_first_argument(
+                arguments,
+                frequency_text,
+                sizeof(frequency_text),
+                &remaining
+            ) ||
+            !parse_uint64(
+                frequency_text,
+                &frequency
+            )
+        )
+        {
+            terminal_write_line(
+                "Usage: beep [frequency] [milliseconds]"
+            );
+            return;
+        }
+
+        if (
+            remaining[0] != '\0' &&
+            !parse_uint64(
+                remaining,
+                &duration
+            )
+        )
+        {
+            terminal_write_line(
+                "Usage: beep [frequency] [milliseconds]"
+            );
+            return;
+        }
+    }
+
+    if (
+        frequency < 20 ||
+        frequency > 20000 ||
+        duration < 10 ||
+        duration > 5000
+    )
+    {
+        terminal_write_line(
+            "Frequency 20-20000 Hz, duration 10-5000 ms"
+        );
+        return;
+    }
+
+    kprintf(
+        "Beeping at %llu Hz for %llu ms\n",
+        (unsigned long long)frequency,
+        (unsigned long long)duration
+    );
+
+    speaker_beep(
+        (uint32_t)frequency,
+        (uint32_t)duration
+    );
+}
+
+static void command_date(
+    const char *arguments
+)
+{
+    (void)arguments;
+
+    rtc_datetime_t datetime;
+
+    if (!rtc_read(&datetime))
+    {
+        terminal_write_line(
+            "Unable to read RTC"
+        );
+        return;
+    }
+
+    char text[32];
+
+    ksnprintf(
+        text,
+        sizeof(text),
+        "%04u-%02u-%02u %02u:%02u:%02u UTC",
+        (uint32_t)datetime.year,
+        (uint32_t)datetime.month,
+        (uint32_t)datetime.day,
+        (uint32_t)datetime.hour,
+        (uint32_t)datetime.minute,
+        (uint32_t)datetime.second
+    );
+
+    terminal_write_line(text);
+}
+
+static void command_serialtest(
+    const char *arguments
+)
+{
+    (void)arguments;
+
+    if (!serial_self_test())
+    {
+        terminal_write_line(
+            "Serial COM1 loopback: failed"
+        );
+        return;
+    }
+
+    serial_write_line(
+        "LatterOS COM1 serial driver is working."
+    );
+
+    terminal_write_line(
+        "Serial COM1 loopback: passed"
+    );
+}
+
+static void command_usb(
+    const char *arguments
+)
+{
+    (void)arguments;
+    usb_print_status();
+}
+
+static void command_net(
+    const char *arguments
+)
+{
+    (void)arguments;
+    network_print_status();
+}
+
+static void command_netsend(
+    const char *arguments
+)
+{
+    (void)arguments;
+
+    if (network_send_test_frame())
+    {
+        terminal_write_line(
+            "Raw Ethernet frame transmitted"
+        );
+    }
+    else
+    {
+        terminal_write_line(
+            "Ethernet transmission failed"
+        );
+    }
+}
+
+static void command_ifconfig(
+    const char *arguments
+)
+{
+    (void)arguments;
+
+    network_print_status();
+    ipv4_print_config();
+}
+
+static void command_arp(
+    const char *arguments
+)
+{
+    if (arguments[0] == '\0')
+    {
+        arp_print_cache();
+        return;
+    }
+
+    uint32_t address;
+
+    if (
+        !ipv4_parse_address(
+            arguments,
+            &address
+        )
+    )
+    {
+        terminal_write_line(
+            "Usage: arp [IPv4]"
+        );
+
+        return;
+    }
+
+    uint8_t mac[6];
+
+    if (
+        !arp_resolve(
+            address,
+            mac,
+            1000
+        )
+    )
+    {
+        terminal_write_line(
+            "ARP resolution timed out"
+        );
+
+        return;
+    }
+
+    char address_text[16];
+
+    ipv4_format_address(
+        address,
+        address_text,
+        sizeof(address_text)
+    );
+
+    kprintf(
+        "%s -> %02X:%02X:%02X:%02X:%02X:%02X\n",
+        address_text,
+        (uint32_t)mac[0],
+        (uint32_t)mac[1],
+        (uint32_t)mac[2],
+        (uint32_t)mac[3],
+        (uint32_t)mac[4],
+        (uint32_t)mac[5]
+    );
+}
+
+static void command_ping(
+    const char *arguments
+)
+{
+    uint32_t address;
+
+    if (
+        !ipv4_parse_address(
+            arguments,
+            &address
+        )
+    )
+    {
+        terminal_write_line(
+            "Usage: ping IPv4"
+        );
+
+        return;
+    }
+
+    char address_text[16];
+
+    ipv4_format_address(
+        address,
+        address_text,
+        sizeof(address_text)
+    );
+
+    kprintf(
+        "PING %s\n",
+        address_text
+    );
+
+    uint32_t elapsed = 0;
+
+    if (
+        icmp_ping(
+            address,
+            1500,
+            &elapsed
+        )
+    )
+    {
+        kprintf(
+            "Reply from %s: time=%u ms\n",
+            address_text,
+            elapsed
+        );
+    }
+    else
+    {
+        kprintf(
+            "Request to %s timed out\n",
+            address_text
+        );
+    }
+}
+
+static void command_udp(
+    const char *arguments
+)
+{
+    (void)arguments;
+    udp_print_status();
+}
+
+static void command_dhcp(
+    const char *arguments
+)
+{
+    (void)arguments;
+
+    terminal_write_line(
+        "Requesting DHCP lease..."
+    );
+
+    if (!dhcp_configure(5000000U))
+    {
+        terminal_write_line(
+            "DHCP request failed"
+        );
+        return;
+    }
+
+    dns_set_server(
+        dhcp_dns_server()
+    );
+
+    terminal_write_line(
+        "DHCP lease acquired"
+    );
+
+    dhcp_print_status();
+    ipv4_print_config();
+}
+
+static void command_dns(
+    const char *arguments
+)
+{
+    if (arguments[0] == '\0')
+    {
+        dns_print_server();
+        return;
+    }
+
+    uint32_t address;
+
+    if (
+        !dns_resolve_a(
+            arguments,
+            5000000U,
+            &address
+        )
+    )
+    {
+        kprintf(
+            "DNS lookup failed: %s\n",
+            arguments
+        );
+        return;
+    }
+
+    char address_text[16];
+
+    ipv4_format_address(
+        address,
+        address_text,
+        sizeof(address_text)
+    );
+
+    kprintf(
+        "%s -> %s\n",
+        arguments,
+        address_text
+    );
+}
+
+
+static bool resolve_network_name(
+    const char *name,
+    uint32_t *address
+)
+{
+    if (
+        name == NULL ||
+        address == NULL ||
+        name[0] == '\0'
+    )
+    {
+        return false;
+    }
+
+    if (
+        ipv4_parse_address(
+            name,
+            address
+        )
+    )
+    {
+        return true;
+    }
+
+    return dns_resolve_a(
+        name,
+        5000000U,
+        address
+    );
+}
+
+static void command_tcp(
+    const char *arguments
+)
+{
+    char host[128];
+    const char *port_text;
+
+    if (
+        !split_first_argument(
+            arguments,
+            host,
+            sizeof(host),
+            &port_text
+        )
+    )
+    {
+        if (arguments[0] == '\0')
+        {
+            tcp_print_status();
+        }
+        else
+        {
+            terminal_write_line(
+                "Usage: tcp HOST [PORT]"
+            );
+        }
+
+        return;
+    }
+
+    uint64_t port = 80;
+
+    if (
+        port_text[0] != '\0' &&
+        (
+            !parse_uint64(
+                port_text,
+                &port
+            ) ||
+            port == 0 ||
+            port > 65535
+        )
+    )
+    {
+        terminal_write_line(
+            "Usage: tcp HOST [PORT]"
+        );
+        return;
+    }
+
+    uint32_t address;
+
+    if (!resolve_network_name(host, &address))
+    {
+        kprintf(
+            "Unable to resolve %s\n",
+            host
+        );
+        return;
+    }
+
+    char address_text[16];
+
+    ipv4_format_address(
+        address,
+        address_text,
+        sizeof(address_text)
+    );
+
+    kprintf(
+        "Connecting to %s:%u...\n",
+        address_text,
+        (uint32_t)port
+    );
+
+    if (
+        !tcp_connect(
+            address,
+            (uint16_t)port,
+            5000
+        )
+    )
+    {
+        terminal_write_line(
+            "TCP connection failed"
+        );
+        return;
+    }
+
+    terminal_write_line(
+        "TCP connection established"
+    );
+
+    tcp_close(1500);
+
+    terminal_write_line(
+        "TCP connection closed"
+    );
+}
+
+static void command_http(
+    const char *arguments
+)
+{
+    char host[128];
+    const char *path;
+
+    if (
+        !split_first_argument(
+            arguments,
+            host,
+            sizeof(host),
+            &path
+        )
+    )
+    {
+        terminal_write_line(
+            "Usage: http HOST [PATH]"
+        );
+        return;
+    }
+
+    if (path[0] == '\0')
+    {
+        path = "/";
+    }
+
+    if (path[0] != '/')
+    {
+        terminal_write_line(
+            "HTTP path must start with /"
+        );
+        return;
+    }
+
+    uint32_t address;
+
+    if (!resolve_network_name(host, &address))
+    {
+        kprintf(
+            "Unable to resolve %s\n",
+            host
+        );
+        return;
+    }
+
+    kprintf(
+        "Connecting to %s...\n",
+        host
+    );
+
+    if (!tcp_connect(address, 80, 5000))
+    {
+        terminal_write_line(
+            "HTTP TCP connection failed"
+        );
+        return;
+    }
+
+    char request[512];
+
+    int request_length =
+        ksnprintf(
+            request,
+            sizeof(request),
+            "GET %s HTTP/1.0\r\n"
+            "Host: %s\r\n"
+            "User-Agent: LatterOS/0.1\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            path,
+            host
+        );
+
+    if (
+        request_length <= 0 ||
+        (size_t)request_length >=
+            sizeof(request) ||
+        !tcp_send_data(
+            request,
+            (size_t)request_length,
+            5000
+        )
+    )
+    {
+        terminal_write_line(
+            "Unable to send HTTP request"
+        );
+        tcp_abort();
+        return;
+    }
+
+    terminal_write_line(
+        "--- HTTP response ---"
+    );
+
+    uint8_t received[256];
+    char printable[257];
+    size_t total = 0;
+    bool received_anything = false;
+
+    while (total < 4096)
+    {
+        size_t length =
+            tcp_receive_data(
+                received,
+                sizeof(received),
+                received_anything ?
+                    1000U : 5000U
+            );
+
+        if (length == 0)
+        {
+            if (
+                tcp_peer_closed() ||
+                received_anything
+            )
+            {
+                break;
+            }
+
+            terminal_write_line(
+                "HTTP response timed out"
+            );
+            break;
+        }
+
+        received_anything = true;
+
+        size_t output = 0;
+
+        for (
+            size_t index = 0;
+            index < length &&
+            total < 4096;
+            index++, total++
+        )
+        {
+            uint8_t character =
+                received[index];
+
+            if (character == '\r')
+            {
+                continue;
+            }
+
+            if (
+                character == '\n' ||
+                character == '\t' ||
+                (
+                    character >= 32 &&
+                    character <= 126
+                )
+            )
+            {
+                printable[output++] =
+                    character == '\t' ?
+                    ' ' : (char)character;
+            }
+            else
+            {
+                printable[output++] = '.';
+            }
+        }
+
+        printable[output] = '\0';
+        terminal_write(printable);
+
+        if (tcp_peer_closed())
+        {
+            break;
+        }
+    }
+
+    terminal_write_line("");
+    terminal_write_line(
+        "--- end response ---"
+    );
+
+    tcp_close(1500);
 }
 
 static void command_panic(

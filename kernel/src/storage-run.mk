@@ -9,9 +9,15 @@ $(DISK_IMAGE):
 run: $(DISK_IMAGE)
 	$(MAKE) -f GNUmakefile TOOLCHAIN=llvm
 	qemu-system-x86_64 \
-		-M pc \
+		-M pc,pcspk-audiodev=audio0 \
 		-cpu qemu64,+x2apic \
 		-m 2G \
+		-audiodev dsound,id=audio0 \
+		-usb \
+		-device usb-tablet \
+		-nic none \
+		-netdev user,id=net0 \
+		-device rtl8139,netdev=net0,mac=52:54:00:12:34:56 \
 		-cdrom $(IMAGE_NAME) \
 		-boot d \
 		-drive file=$(DISK_IMAGE),format=raw,if=ide,index=0,media=disk

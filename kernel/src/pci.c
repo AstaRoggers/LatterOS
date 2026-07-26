@@ -54,6 +54,97 @@ uint32_t pci_config_read32(
     return inl(PCI_CONFIG_DATA_PORT);
 }
 
+void pci_config_write32(
+    uint8_t bus,
+    uint8_t device,
+    uint8_t function,
+    uint8_t offset,
+    uint32_t value
+)
+{
+    outl(
+        PCI_CONFIG_ADDRESS_PORT,
+        pci_config_address(
+            bus,
+            device,
+            function,
+            offset
+        )
+    );
+
+    outl(
+        PCI_CONFIG_DATA_PORT,
+        value
+    );
+}
+
+void pci_config_write16(
+    uint8_t bus,
+    uint8_t device,
+    uint8_t function,
+    uint8_t offset,
+    uint16_t value
+)
+{
+    uint8_t aligned_offset =
+        (uint8_t)(offset & 0xFCU);
+
+    uint32_t current =
+        pci_config_read32(
+            bus,
+            device,
+            function,
+            aligned_offset
+        );
+
+    uint8_t shift =
+        (uint8_t)((offset & 2U) * 8U);
+
+    uint32_t mask =
+        0xFFFFU << shift;
+
+    uint32_t updated =
+        (current & ~mask) |
+        ((uint32_t)value << shift);
+
+    pci_config_write32(
+        bus,
+        device,
+        function,
+        aligned_offset,
+        updated
+    );
+}
+
+void pci_set_command_bits(
+    const pci_device_t *device,
+    uint16_t bits
+)
+{
+    if (device == NULL)
+    {
+        return;
+    }
+
+    uint16_t command =
+        pci_config_read16(
+            device->bus,
+            device->device,
+            device->function,
+            0x04
+        );
+
+    command |= bits;
+
+    pci_config_write16(
+        device->bus,
+        device->device,
+        device->function,
+        0x04,
+        command
+    );
+}
+
 uint16_t pci_config_read16(
     uint8_t bus,
     uint8_t device,

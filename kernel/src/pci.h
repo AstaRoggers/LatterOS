@@ -58,6 +58,27 @@ uint8_t pci_config_read8(
     uint8_t offset
 );
 
+void pci_config_write32(
+    uint8_t bus,
+    uint8_t device,
+    uint8_t function,
+    uint8_t offset,
+    uint32_t value
+);
+
+void pci_config_write16(
+    uint8_t bus,
+    uint8_t device,
+    uint8_t function,
+    uint8_t offset,
+    uint16_t value
+);
+
+void pci_set_command_bits(
+    const pci_device_t *device,
+    uint16_t bits
+);
+
 void pci_print_devices(void);
 
 #endif
