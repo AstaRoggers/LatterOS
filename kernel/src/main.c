@@ -15,6 +15,7 @@
 #include "pci.h"
 #include "physical_memory.h"
 #include "pic.h"
+#include "process.h"
 #include "ramfs.h"
 #include "storage.h"
 #include "terminal.h"
@@ -204,6 +205,8 @@ void kmain(void)
     {
         hcf();
     }
+
+    process_init();
 
     vfs_init();
 

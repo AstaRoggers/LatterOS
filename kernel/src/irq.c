@@ -3,6 +3,7 @@
 #include "lapic.h"
 #include "panic.h"
 #include "pic.h"
+#include "process.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -11,6 +12,7 @@
 #define IRQ_COUNT        16
 #define IRQ_VECTOR_BASE  32
 #define IRQ_VECTOR_END   47
+#define SCHEDULER_VECTOR 128
 #define SPURIOUS_VECTOR  255
 
 static irq_handler_t irq_handlers[IRQ_COUNT];
@@ -94,13 +96,21 @@ void irq_disable(void)
     );
 }
 
-void interrupt_dispatch(
-    uint64_t vector
+cpu_context_t *interrupt_dispatch(
+    uint64_t vector,
+    cpu_context_t *context
 )
 {
     if (vector == SPURIOUS_VECTOR)
     {
-        return;
+        return context;
+    }
+
+    if (vector == SCHEDULER_VECTOR)
+    {
+        return process_schedule_now(
+            context
+        );
     }
 
     if (vector < IRQ_VECTOR_BASE)
@@ -109,6 +119,8 @@ void interrupt_dispatch(
             "Unhandled CPU exception",
             vector
         );
+
+        return context;
     }
 
     if (vector <= IRQ_VECTOR_END)
@@ -134,11 +146,20 @@ void interrupt_dispatch(
             lapic_send_eoi();
         }
 
-        return;
+        if (irq == 0)
+        {
+            return process_schedule_on_timer(
+                context
+            );
+        }
+
+        return context;
     }
 
     kernel_panic(
         "Unhandled interrupt vector",
         vector
     );
+
+    return context;
 }

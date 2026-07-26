@@ -1,6 +1,8 @@
 #ifndef IRQ_H
 #define IRQ_H
 
+#include "cpu_context.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -28,8 +30,9 @@ void irq_disable(void);
  * Called by interrupt_stubs.S.
  * Do not call this function directly.
  */
-void interrupt_dispatch(
-    uint64_t vector
+cpu_context_t *interrupt_dispatch(
+    uint64_t vector,
+    cpu_context_t *context
 );
 
 #endif

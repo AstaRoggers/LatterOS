@@ -42,18 +42,25 @@ isr_common:
 
     /*
      * Fifteen registers were pushed: 15 * 8 = 120 bytes.
-     * The interrupt vector is therefore 120 bytes above RSP.
+     * Pass the vector in RDI and the complete saved CPU context
+     * in RSI. The dispatcher returns the context to restore.
      */
     movq 120(%rsp), %rdi
+    movq %rsp, %rsi
 
     /*
-     * Preserve the exact interrupt stack pointer in RBX. RBX is
-     * callee-saved under the System V AMD64 ABI.
+     * Preserve the original context pointer in RBX in case the
+     * dispatcher returns NULL. RBX is callee-saved by SysV AMD64.
      */
     movq %rsp, %rbx
     andq $-16, %rsp
     call interrupt_dispatch
-    movq %rbx, %rsp
+
+    testq %rax, %rax
+    jnz 1f
+    movq %rbx, %rax
+1:
+    movq %rax, %rsp
 
     popq %r15
     popq %r14

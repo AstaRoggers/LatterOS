@@ -2,6 +2,7 @@
 
 #include "block_device.h"
 #include "pci.h"
+#include "process.h"
 #include "storage.h"
 #include "terminal.h"
 #include "timer.h"
@@ -305,6 +306,14 @@ static void command_write(
     const char *arguments
 );
 
+static void command_ps(
+    const char *arguments
+);
+
+static void command_spawn(
+    const char *arguments
+);
+
 static void command_panic(
     const char *arguments
 );
@@ -389,6 +398,16 @@ static const shell_command_t commands[] = {
         "write",
         "Write text: write PATH TEXT",
         command_write
+    },
+    {
+        "ps",
+        "List kernel processes",
+        command_ps
+    },
+    {
+        "spawn",
+        "Create a kernel worker thread",
+        command_spawn
     },
     {
         "panic",
@@ -949,6 +968,34 @@ static void command_write(
     terminal_write_line(
         "File written"
     );
+}
+
+static void command_ps(
+    const char *arguments
+)
+{
+    (void)arguments;
+    process_print_all();
+}
+
+static void command_spawn(
+    const char *arguments
+)
+{
+    (void)arguments;
+
+    if (process_spawn_demo_thread())
+    {
+        terminal_write_line(
+            "Kernel worker thread created"
+        );
+    }
+    else
+    {
+        terminal_write_line(
+            "Unable to create worker thread"
+        );
+    }
 }
 
 static void command_panic(
