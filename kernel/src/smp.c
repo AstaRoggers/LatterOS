@@ -1,5 +1,6 @@
 #include "smp.h"
 
+#include "cpu_local.h"
 #include "gdt.h"
 #include "idt.h"
 #include "irq.h"
@@ -14,6 +15,10 @@
 #define SMP_STARTUP_SPIN_LIMIT 100000000ULL
 
 static smp_cpu_t cpu_states[SMP_MAX_CPUS];
+static struct limine_mp_info *startup_information[
+    SMP_MAX_CPUS
+];
+
 static uint32_t discovered_count;
 static uint32_t bsp_id;
 static bool available;
@@ -24,7 +29,8 @@ static void clear_bytes(
     size_t count
 )
 {
-    uint8_t *bytes = pointer;
+    uint8_t *bytes =
+        (uint8_t *)pointer;
 
     for (
         size_t index = 0;
@@ -77,27 +83,87 @@ static smp_cpu_t *find_by_apic_id(
     return NULL;
 }
 
+static bool configure_slot(
+    uint32_t index,
+    struct limine_mp_info *information,
+    bool bsp
+)
+{
+    if (
+        index >= SMP_MAX_CPUS ||
+        information == NULL
+    )
+    {
+        return false;
+    }
+
+    cpu_states[index].index = index;
+    cpu_states[index].processor_id =
+        information->processor_id;
+
+    cpu_states[index].apic_id =
+        information->lapic_id;
+
+    cpu_states[index].bsp = bsp;
+    startup_information[index] = information;
+
+    (void)cpu_local_configure(
+        index,
+        information->processor_id,
+        information->lapic_id,
+        bsp
+    );
+
+    state_store(
+        &cpu_states[index].state,
+        bsp ?
+            SMP_CPU_ONLINE :
+            SMP_CPU_STARTING
+    );
+
+    return true;
+}
+
+static __attribute__((noreturn)) void halt_cpu(void)
+{
+    for (;;)
+    {
+        __asm__ volatile("cli; hlt");
+    }
+}
+
 static __attribute__((noreturn)) void smp_ap_entry(
     struct limine_mp_info *information
 )
 {
+    if (information == NULL)
+    {
+        halt_cpu();
+    }
+
     uint32_t index =
         (uint32_t)information->extra_argument;
 
     if (index >= discovered_count)
     {
-        for (;;)
-        {
-            __asm__ volatile("cli; hlt");
-        }
+        halt_cpu();
     }
 
     /*
-     * Limine enters the AP in 64-bit mode with a private stack. Load
-     * the shared LatterOS descriptor tables, initialize this CPU's
-     * local APIC, publish per-CPU state, and enter the AP work loop.
+     * Every AP receives its own descriptor table, TSS, ring-transition
+     * stack, emergency stack, and GS-backed CPU-local data before it
+     * enables interrupts or enters the worker loop.
      */
-    gdt_load_secondary();
+    if (!gdt_load_secondary(index))
+    {
+        state_store(
+            &cpu_states[index].state,
+            SMP_CPU_OFFLINE
+        );
+
+        halt_cpu();
+    }
+
     idt_load();
 
     if (!lapic_init_secondary())
@@ -107,14 +173,21 @@ static __attribute__((noreturn)) void smp_ap_entry(
             SMP_CPU_OFFLINE
         );
 
-        for (;;)
-        {
-            __asm__ volatile("cli; hlt");
-        }
+        halt_cpu();
     }
 
-    cpu_states[index].apic_id =
+    uint32_t actual_apic_id =
         lapic_id();
+
+    cpu_states[index].apic_id =
+        actual_apic_id;
+
+    (void)cpu_local_configure(
+        index,
+        information->processor_id,
+        actual_apic_id,
+        false
+    );
 
     smp_scheduler_cpu_online(index);
 
@@ -136,6 +209,11 @@ bool smp_init(
         sizeof(cpu_states)
     );
 
+    clear_bytes(
+        startup_information,
+        sizeof(startup_information)
+    );
+
     discovered_count = 0;
     bsp_id = 0;
     available = false;
@@ -150,65 +228,98 @@ bool smp_init(
         return false;
     }
 
-    uint64_t reported_count =
-        response->cpu_count;
-
-    if (reported_count > SMP_MAX_CPUS)
-    {
-        reported_count = SMP_MAX_CPUS;
-    }
-
-    discovered_count =
-        (uint32_t)reported_count;
-
     bsp_id = response->bsp_lapic_id;
 
     x2apic_mode =
         (response->flags &
             LIMINE_MP_RESPONSE_X86_64_X2APIC) != 0;
 
+    struct limine_mp_info *bsp_information =
+        NULL;
+
     for (
-        uint32_t index = 0;
+        uint64_t source_index = 0;
+        source_index < response->cpu_count;
+        source_index++
+    )
+    {
+        struct limine_mp_info *information =
+            response->cpus[source_index];
+
+        if (
+            information != NULL &&
+            information->lapic_id == bsp_id
+        )
+        {
+            bsp_information = information;
+            break;
+        }
+    }
+
+    if (bsp_information == NULL)
+    {
+        return false;
+    }
+
+    /* Keep the BSP at logical CPU index zero for the existing worker API. */
+    if (!configure_slot(0, bsp_information, true))
+    {
+        return false;
+    }
+
+    discovered_count = 1;
+
+    for (
+        uint64_t source_index = 0;
+        source_index < response->cpu_count &&
+            discovered_count < SMP_MAX_CPUS;
+        source_index++
+    )
+    {
+        struct limine_mp_info *information =
+            response->cpus[source_index];
+
+        if (
+            information == NULL ||
+            information == bsp_information
+        )
+        {
+            continue;
+        }
+
+        if (
+            configure_slot(
+                discovered_count,
+                information,
+                false
+            )
+        )
+        {
+            discovered_count++;
+        }
+    }
+
+    /* Publish the BSP's actual APIC identity in its CPU-local block. */
+    cpu_states[0].apic_id = lapic_id();
+
+    (void)cpu_local_configure(
+        0,
+        bsp_information->processor_id,
+        cpu_states[0].apic_id,
+        true
+    );
+
+    available = true;
+
+    /* Start APs only after every logical slot is fully configured. */
+    for (
+        uint32_t index = 1;
         index < discovered_count;
         index++
     )
     {
         struct limine_mp_info *information =
-            response->cpus[index];
-
-        cpu_states[index].index = index;
-
-        if (information == NULL)
-        {
-            state_store(
-                &cpu_states[index].state,
-                SMP_CPU_OFFLINE
-            );
-            continue;
-        }
-
-        cpu_states[index].processor_id =
-            information->processor_id;
-
-        cpu_states[index].apic_id =
-            information->lapic_id;
-
-        cpu_states[index].bsp =
-            information->lapic_id == bsp_id;
-
-        if (cpu_states[index].bsp)
-        {
-            state_store(
-                &cpu_states[index].state,
-                SMP_CPU_ONLINE
-            );
-            continue;
-        }
-
-        state_store(
-            &cpu_states[index].state,
-            SMP_CPU_STARTING
-        );
+            startup_information[index];
 
         information->extra_argument = index;
 
@@ -220,12 +331,10 @@ bool smp_init(
             smp_ap_entry;
     }
 
-    available = true;
-
     /*
-     * Give the application processors time to publish that they
-     * reached their parked state. Failure to reach it does not stop
-     * the BSP; offline CPUs remain visible in the diagnostic command.
+     * Give APs time to load their private GDT/TSS and publish worker
+     * state. A failed AP remains visible as starting/offline without
+     * blocking the BSP forever.
      */
     for (
         uint64_t spin = 0;
@@ -290,6 +399,27 @@ uint32_t smp_bsp_apic_id(void)
     return bsp_id;
 }
 
+uint32_t smp_current_cpu_index(void)
+{
+    cpu_local_t *local =
+        cpu_local_current();
+
+    if (
+        local != NULL &&
+        local->index < discovered_count
+    )
+    {
+        return local->index;
+    }
+
+    smp_cpu_t *cpu =
+        find_by_apic_id(lapic_id());
+
+    return cpu != NULL ?
+        cpu->index :
+        0;
+}
+
 const smp_cpu_t *smp_cpu(uint32_t index)
 {
     if (index >= discovered_count)
@@ -302,9 +432,15 @@ const smp_cpu_t *smp_cpu(uint32_t index)
 
 const smp_cpu_t *smp_current_cpu(void)
 {
-    return find_by_apic_id(
-        lapic_id()
-    );
+    uint32_t index =
+        smp_current_cpu_index();
+
+    if (index < discovered_count)
+    {
+        return &cpu_states[index];
+    }
+
+    return NULL;
 }
 
 const char *smp_cpu_state_name(
@@ -357,22 +493,80 @@ void smp_print_status(void)
         const smp_cpu_t *cpu =
             &cpu_states[index];
 
+        const cpu_local_t *local =
+            cpu_local_get(index);
+
         smp_cpu_state_t state =
             (smp_cpu_state_t)state_load(
                 &cpu->state
             );
 
+        const char *task_name = "none";
+
+        if (local != NULL)
+        {
+            if (
+                local->current_process_slot == 0 &&
+                local->current_pid == 0
+            )
+            {
+                task_name = "kernel";
+            }
+            else if (
+                local->current_process_slot ==
+                CPU_LOCAL_NO_PROCESS &&
+                state == SMP_CPU_WORKER
+            )
+            {
+                task_name = "AP-worker";
+            }
+            else if (
+                local->current_process_slot !=
+                CPU_LOCAL_NO_PROCESS
+            )
+            {
+                task_name = "process";
+            }
+        }
+
         kprintf(
-            "CPU %u: processor=%u APIC=%u %s %s\n",
+            "CPU %u: processor=%u APIC=%u %s %s local=%s GDT/TSS=%s task=%s\n",
             (unsigned int)index,
             (unsigned int)cpu->processor_id,
             (unsigned int)cpu->apic_id,
             cpu->bsp ? "BSP" : "AP",
-            smp_cpu_state_name(state)
+            smp_cpu_state_name(state),
+            local != NULL && local->bound ?
+                "bound" : "unbound",
+            gdt_cpu_ready(index) ?
+                "ready" : "missing",
+            task_name
+        );
+
+        kprintf(
+            "       TSS=0x%llX RSP0=0x%llX IST1=0x%llX pid=%llu ticks=%llu switches=%llu\n",
+            (unsigned long long)
+                gdt_tss_address(index),
+            (unsigned long long)
+                gdt_kernel_stack_top(index),
+            (unsigned long long)
+                gdt_interrupt_stack_top(index),
+            (unsigned long long)(
+                local != NULL ?
+                    local->current_pid : 0
+            ),
+            (unsigned long long)(
+                local != NULL ?
+                    local->scheduler_ticks : 0
+            ),
+            (unsigned long long)(
+                local != NULL ?
+                    local->context_switches : 0
+            )
         );
     }
 
     kprintf(
-        "Scheduler: BSP process scheduler + AP work queues\n"
+        "Scheduler: BSP process scheduler + AP work queues; per-CPU process run queues not enabled yet\n"
     );
 }

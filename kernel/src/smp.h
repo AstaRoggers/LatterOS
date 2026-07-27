@@ -1,11 +1,13 @@
 #ifndef SMP_H
 #define SMP_H
 
+#include "cpu_local.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 #include <limine.h>
 
-#define SMP_MAX_CPUS 64
+#define SMP_MAX_CPUS CPU_LOCAL_MAX_CPUS
 
 typedef enum
 {
@@ -31,10 +33,10 @@ bool smp_init(
 
 bool smp_is_available(void);
 bool smp_uses_x2apic(void);
-
 uint32_t smp_cpu_count(void);
 uint32_t smp_online_count(void);
 uint32_t smp_bsp_apic_id(void);
+uint32_t smp_current_cpu_index(void);
 
 const smp_cpu_t *smp_cpu(uint32_t index);
 const smp_cpu_t *smp_current_cpu(void);

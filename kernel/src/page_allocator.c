@@ -1,13 +1,17 @@
 #include "page_allocator.h"
-#include "physical_memory.h"
 
-#include <stdint.h>
+#include "physical_memory.h"
+#include "spinlock.h"
+
 #include <stddef.h>
+#include <stdint.h>
 
 #define MAX_PAGES 262144
 
 static void *free_pages[MAX_PAGES];
 static uint64_t available_page_count;
+static spinlock_t allocator_lock =
+    SPINLOCK_INITIALIZER;
 
 static uint64_t align_up(
     uint64_t value,
@@ -21,19 +25,20 @@ static uint64_t align_up(
 
 void page_allocator_init(void)
 {
+    spinlock_init(&allocator_lock);
     available_page_count = 0;
 
     uint64_t region_count =
         physical_memory_entry_count();
 
     for (
-        uint64_t i = 0;
-        i < region_count;
-        i++
+        uint64_t index = 0;
+        index < region_count;
+        index++
     )
     {
         memory_region_t region =
-            physical_memory_entry(i);
+            physical_memory_entry(index);
 
         if (!region.usable)
         {
@@ -67,14 +72,26 @@ void page_allocator_init(void)
 
 void *alloc_page(void)
 {
-    if (available_page_count == 0)
+    uint64_t interrupt_flags =
+        spinlock_lock_irqsave(
+            &allocator_lock
+        );
+
+    void *page = NULL;
+
+    if (available_page_count != 0)
     {
-        return NULL;
+        available_page_count--;
+        page = free_pages[available_page_count];
+        free_pages[available_page_count] = NULL;
     }
 
-    available_page_count--;
+    spinlock_unlock_irqrestore(
+        &allocator_lock,
+        interrupt_flags
+    );
 
-    return free_pages[available_page_count];
+    return page;
 }
 
 void free_page(void *page)
@@ -84,16 +101,37 @@ void free_page(void *page)
         return;
     }
 
-    if (available_page_count >= MAX_PAGES)
+    uint64_t interrupt_flags =
+        spinlock_lock_irqsave(
+            &allocator_lock
+        );
+
+    if (available_page_count < MAX_PAGES)
     {
-        return;
+        free_pages[available_page_count] = page;
+        available_page_count++;
     }
 
-    free_pages[available_page_count] = page;
-    available_page_count++;
+    spinlock_unlock_irqrestore(
+        &allocator_lock,
+        interrupt_flags
+    );
 }
 
 uint64_t free_page_count(void)
 {
-    return available_page_count;
+    uint64_t interrupt_flags =
+        spinlock_lock_irqsave(
+            &allocator_lock
+        );
+
+    uint64_t count =
+        available_page_count;
+
+    spinlock_unlock_irqrestore(
+        &allocator_lock,
+        interrupt_flags
+    );
+
+    return count;
 }
