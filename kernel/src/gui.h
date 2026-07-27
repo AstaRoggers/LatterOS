@@ -25,10 +25,12 @@ typedef struct
 } gui_application_info_t;
 
 uint32_t gui_application_count(void);
+
 bool gui_application_get(
     uint32_t index,
     gui_application_info_t *information
 );
+
 bool gui_application_close(uint32_t id);
 
 #endif
