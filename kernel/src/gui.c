@@ -6,6 +6,7 @@
 #include "desktop_editor.h"
 #include "desktop_font.h"
 #include "desktop_services.h"
+#include "display.h"
 #include "graphics.h"
 #include "keyboard.h"
 #include "mouse.h"
@@ -19,6 +20,7 @@
 #include "ui.h"
 #include "ui_controls.h"
 #include "vfs.h"
+#include "virtio_gpu.h"
 #include "window_manager.h"
 
 #include <stdbool.h>
@@ -733,18 +735,33 @@ static int32_t pointer_scale_fixed(
     int32_t delta_y
 )
 {
-    int32_t speed =
-        absolute_value(delta_x) +
-        absolute_value(delta_y);
+    (void)delta_x;
+    (void)delta_y;
 
-    int32_t bonus = speed * 8;
+    /*
+     * Keep the virtual mouse strictly one-to-one. QEMU can coalesce
+     * relative reports when its window is moved, resized, grabbed, or
+     * released. Accelerating those reports turns a harmless burst into a
+     * jump across the desktop.
+     */
+    return GUI_POINTER_FIXED_ONE;
+}
 
-    if (bonus > 96)
+static int32_t clamp_pointer_delta(int32_t delta)
+{
+    const int32_t maximum_delta = 96;
+
+    if (delta > maximum_delta)
     {
-        bonus = 96;
+        return maximum_delta;
     }
 
-    return GUI_POINTER_FIXED_ONE + bonus;
+    if (delta < -maximum_delta)
+    {
+        return -maximum_delta;
+    }
+
+    return delta;
 }
 
 static void clamp_cursor_target(void)
@@ -3807,6 +3824,17 @@ static void render_gui_scene(void)
     render_file_drag();
     ui_menu_render(&popup_menu, &palette);
     desktop_dialog_render(&dialog, &palette);
+
+    /*
+     * Native Virtio scanout cannot use the Limine front-buffer overlay.
+     * Compose the pointer into the same damage-tracked scene as windows.
+     * This keeps the visible pointer and GUI hit-testing on one coordinate
+     * path and completely avoids the unstable Virtio cursor queue.
+     */
+    if (cursor_visible && virtio_gpu_available())
+    {
+        ui_draw_cursor(cursor_x, cursor_y);
+    }
 }
 
 static void prepare_drag_cache(uint8_t index)
@@ -5518,12 +5546,37 @@ static void commit_cursor_position(void)
         return;
     }
 
+    int32_t old_x = cursor_x;
+    int32_t old_y = cursor_y;
+
     cursor_x = new_x;
     cursor_y = new_y;
 
     if (cursor_visible)
     {
-        graphics_cursor_move(cursor_x, cursor_y);
+        if (virtio_gpu_available())
+        {
+            ui_rect_t old_cursor = {
+                .x = old_x,
+                .y = old_y,
+                .width = GUI_CURSOR_SIZE,
+                .height = GUI_CURSOR_SIZE
+            };
+
+            ui_rect_t new_cursor = {
+                .x = cursor_x,
+                .y = cursor_y,
+                .width = GUI_CURSOR_SIZE,
+                .height = GUI_CURSOR_SIZE
+            };
+
+            compositor_invalidate(&old_cursor);
+            compositor_invalidate(&new_cursor);
+        }
+        else
+        {
+            graphics_cursor_move(cursor_x, cursor_y);
+        }
     }
 
     gui_event_t move = {
@@ -5553,8 +5606,13 @@ static void update_mouse_events(void)
 
     if (packet_changed)
     {
-        int32_t delta_x = state.x - last_mouse_x;
-        int32_t delta_y = state.y - last_mouse_y;
+        int32_t delta_x = clamp_pointer_delta(
+            state.x - last_mouse_x
+        );
+
+        int32_t delta_y = clamp_pointer_delta(
+            state.y - last_mouse_y
+        );
 
         int32_t scale = pointer_scale_fixed(
             delta_x,
@@ -5680,6 +5738,28 @@ static void start_gui(void)
     graphics_set_deferred(true);
     compositor_init(render_gui_scene);
 
+    if (virtio_gpu_available())
+    {
+        desktop_notify(
+            "Display: Virtio-GPU scanout with stable composited cursor",
+            5000U
+        );
+    }
+    else
+    {
+        desktop_notify(
+            display_triple_buffered() ?
+                "Display: triple-buffered software fallback" :
+                "Display: direct framebuffer fallback",
+            5000U
+        );
+
+        desktop_notify(
+            virtio_gpu_status_text(),
+            7000U
+        );
+    }
+
     event_read_index = 0;
     event_write_index = 0;
 
@@ -5695,7 +5775,15 @@ static void start_gui(void)
     cursor_visible = true;
     drag_cache_valid = false;
     drag_cache_window = GUI_WINDOW_COUNT;
-    graphics_cursor_show(cursor_x, cursor_y);
+    if (virtio_gpu_available())
+    {
+        /* The pointer is rendered by render_gui_scene(). */
+        graphics_cursor_hide();
+    }
+    else
+    {
+        graphics_cursor_show(cursor_x, cursor_y);
+    }
 
     last_frame_tick = timer_ticks();
     frame_accumulator = timer_frequency();
@@ -5940,6 +6028,8 @@ void gui_update(void)
         return;
     }
 
+    display_update();
+
     bool render_frame = frame_is_due();
 
     update_clock(false);
@@ -5964,6 +6054,8 @@ void gui_update(void)
     {
         compositor_render();
     }
+
+    display_update();
 }
 
 bool gui_is_active(void)

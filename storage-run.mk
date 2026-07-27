@@ -40,6 +40,9 @@ run: $(DISK_IMAGE) $(USB_DISK_IMAGE) $(SATA_DISK_IMAGE) $(NVME_DISK_IMAGE)
 		-smp cpus=4,sockets=1,cores=4,threads=1,maxcpus=4 \
 		-m 2G \
 		-audiodev dsound,id=audio0 \
+		-vga none \
+		-device virtio-vga,id=latteros-gpu,xres=1280,yres=800 \
+		-display gtk,zoom-to-fit=off,show-menubar=off \
 		-serial file:latteros-serial.log \
 		-monitor stdio \
 		-usb \
