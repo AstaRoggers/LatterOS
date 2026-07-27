@@ -103,14 +103,15 @@ bool cpu_local_configure(
     {
         local->current_process_slot = 0;
         local->current_pid = 0;
+        local->current_kernel_thread_id = 0;
     }
-    else if (
-        local->current_process_slot == 0 &&
-        local->current_pid == 0
-    )
+    else
     {
         local->current_process_slot =
             CPU_LOCAL_NO_PROCESS;
+
+        local->current_pid = 0;
+        local->current_kernel_thread_id = 0;
     }
 
     return true;
@@ -234,6 +235,32 @@ void cpu_local_set_current_process(
         process_slot;
 
     local->current_pid = pid;
+
+    if (process_slot != CPU_LOCAL_NO_PROCESS)
+    {
+        local->current_kernel_thread_id = 0;
+    }
+}
+
+void cpu_local_set_current_kernel_thread(
+    uint32_t index,
+    uint64_t thread_id
+)
+{
+    cpu_local_t *local =
+        cpu_local_by_index(index);
+
+    if (local == NULL)
+    {
+        return;
+    }
+
+    local->current_process_slot =
+        CPU_LOCAL_NO_PROCESS;
+
+    local->current_pid = 0;
+    local->current_kernel_thread_id =
+        thread_id;
 }
 
 void cpu_local_charge_scheduler_tick(uint32_t index)

@@ -18,6 +18,8 @@
 #define SYSCALL_VECTOR   128
 #define SCHEDULER_VECTOR 129
 #define SMP_IPI_VECTOR   SMP_SCHEDULER_IPI_VECTOR
+#define SMP_YIELD_VECTOR SMP_SCHEDULER_YIELD_VECTOR
+#define SMP_TIMER_VECTOR SMP_SCHEDULER_TIMER_VECTOR
 #define SPURIOUS_VECTOR  255
 
 static irq_handler_t irq_handlers[IRQ_COUNT];
@@ -174,6 +176,28 @@ cpu_context_t *interrupt_dispatch(
         }
 
         return context;
+    }
+
+    if (vector == SMP_YIELD_VECTOR)
+    {
+        return smp_scheduler_handle_yield(
+            context
+        );
+    }
+
+    if (vector == SMP_TIMER_VECTOR)
+    {
+        cpu_context_t *next =
+            smp_scheduler_handle_timer(
+                context
+            );
+
+        if (use_lapic)
+        {
+            lapic_send_eoi();
+        }
+
+        return next;
     }
 
     if (vector < IRQ_VECTOR_BASE)

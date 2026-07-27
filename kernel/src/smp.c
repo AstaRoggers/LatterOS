@@ -191,6 +191,17 @@ static __attribute__((noreturn)) void smp_ap_entry(
 
     smp_scheduler_cpu_online(index);
 
+    bool preemption_ready =
+        lapic_timer_start_periodic(
+            SMP_SCHEDULER_TIMER_VECTOR,
+            SMP_SCHEDULER_TIMER_HZ
+        );
+
+    smp_scheduler_set_preemption(
+        index,
+        preemption_ready
+    );
+
     state_store(
         &cpu_states[index].state,
         SMP_CPU_WORKER
@@ -310,6 +321,13 @@ bool smp_init(
     );
 
     available = true;
+
+    /*
+     * Calibrate the x2APIC timer against the already-running 1000 Hz
+     * PIT before APs are released. Every AP then programs the same
+     * calibrated timer rate for local preemptive scheduling.
+     */
+    (void)lapic_timer_calibrate();
 
     /* Start APs only after every logical slot is fully configured. */
     for (
@@ -459,7 +477,7 @@ const char *smp_cpu_state_name(
             return "online/parked";
 
         case SMP_CPU_WORKER:
-            return "online/worker";
+            return "online/scheduler";
 
         default:
             return "offline";
@@ -513,12 +531,18 @@ void smp_print_status(void)
                 task_name = "kernel";
             }
             else if (
+                local->current_kernel_thread_id != 0
+            )
+            {
+                task_name = "kthread";
+            }
+            else if (
                 local->current_process_slot ==
                 CPU_LOCAL_NO_PROCESS &&
                 state == SMP_CPU_WORKER
             )
             {
-                task_name = "AP-worker";
+                task_name = "AP-idle";
             }
             else if (
                 local->current_process_slot !=
@@ -544,7 +568,7 @@ void smp_print_status(void)
         );
 
         kprintf(
-            "       TSS=0x%llX RSP0=0x%llX IST1=0x%llX pid=%llu ticks=%llu switches=%llu\n",
+            "       TSS=0x%llX RSP0=0x%llX IST1=0x%llX pid=%llu kthread=%llu ticks=%llu switches=%llu preempt=%s\n",
             (unsigned long long)
                 gdt_tss_address(index),
             (unsigned long long)
@@ -557,16 +581,30 @@ void smp_print_status(void)
             ),
             (unsigned long long)(
                 local != NULL ?
+                    local->current_kernel_thread_id : 0
+            ),
+            (unsigned long long)(
+                local != NULL ?
                     local->scheduler_ticks : 0
             ),
             (unsigned long long)(
                 local != NULL ?
                     local->context_switches : 0
-            )
+            ),
+            smp_scheduler_preemption_enabled(index) ?
+                "yes" : "no"
         );
     }
 
     kprintf(
-        "Scheduler: BSP process scheduler + AP work queues; per-CPU process run queues not enabled yet\n"
+        "Scheduler: BSP process scheduler + AP stackful kernel threads; user processes remain BSP-only\n"
+    );
+
+    kprintf(
+        "AP timer: calibrated=%s base=%llu Hz target=%u Hz\n",
+        lapic_timer_is_calibrated() ? "yes" : "no",
+        (unsigned long long)
+            lapic_timer_base_frequency(),
+        (unsigned int)SMP_SCHEDULER_TIMER_HZ
     );
 }

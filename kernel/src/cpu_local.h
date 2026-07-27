@@ -27,6 +27,7 @@ typedef struct cpu_local
     uint32_t current_process_slot;
     uint32_t reserved0;
     uint64_t current_pid;
+    uint64_t current_kernel_thread_id;
 
     uint64_t scheduler_ticks;
     uint64_t context_switches;
@@ -58,6 +59,11 @@ void cpu_local_set_current_process(
     uint32_t index,
     uint32_t process_slot,
     uint64_t pid
+);
+
+void cpu_local_set_current_kernel_thread(
+    uint32_t index,
+    uint64_t thread_id
 );
 
 void cpu_local_charge_scheduler_tick(uint32_t index);

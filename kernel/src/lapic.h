@@ -21,4 +21,15 @@ bool lapic_send_ipi(
     uint8_t vector
 );
 
+bool lapic_timer_calibrate(void);
+
+bool lapic_timer_start_periodic(
+    uint8_t vector,
+    uint32_t frequency
+);
+
+void lapic_timer_stop(void);
+bool lapic_timer_is_calibrated(void);
+uint64_t lapic_timer_base_frequency(void);
+
 #endif

@@ -1,7 +1,7 @@
 [000001] INFO boot: LatterOS starting; framebuffer=1280x800 pitch=5120 serial=ready
 [000002] INFO cpu: GDT and IDT initialized
 [000003] INFO acpi: tables=ready root=RSDT cpus=4 ioapics=1
-[000004] INFO memory: usable=2077284 KiB pages=519321 free=262143
+[000004] INFO memory: usable=2076216 KiB pages=519054 free=262143
 [000005] INFO process: Process scheduler initialized
 [000006] INFO pci: devices=9 storage=detected ahci-disks=1
 [000007] INFO filesystem: LatterOS filesystem mounted; entries=8 used=138 bytes partitions=3
