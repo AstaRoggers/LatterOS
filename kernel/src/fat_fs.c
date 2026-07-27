@@ -3654,6 +3654,58 @@ bool fat_fs_mount_first_sata(void)
     return false;
 }
 
+bool fat_fs_mount_first_nvme(void)
+{
+    if (mounted_filesystem != NULL)
+    {
+        return false;
+    }
+
+    for (
+        uint32_t index = 0;
+        index < block_device_count();
+        index++
+    )
+    {
+        const block_device_t *device =
+            block_device_get(index);
+
+        if (
+            device_name_starts_with(
+                device,
+                "NVMe partition"
+            ) &&
+            mount_device_at(device, "/media/nvme")
+        )
+        {
+            return true;
+        }
+    }
+
+    for (
+        uint32_t index = 0;
+        index < block_device_count();
+        index++
+    )
+    {
+        const block_device_t *device =
+            block_device_get(index);
+
+        if (
+            device_name_starts_with(
+                device,
+                "NVMe namespace"
+            ) &&
+            mount_device_at(device, "/media/nvme")
+        )
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 bool fat_fs_sync(void)
 {
     if (mounted_filesystem == NULL)

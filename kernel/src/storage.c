@@ -3,6 +3,7 @@
 #include "ahci.h"
 #include "ata.h"
 #include "block_device.h"
+#include "nvme.h"
 #include "terminal.h"
 
 #include <stddef.h>
@@ -68,11 +69,11 @@ static uint8_t controller_priority(
 {
     switch (type)
     {
+        case STORAGE_CONTROLLER_NVME:
+            return 5;
+
         case STORAGE_CONTROLLER_AHCI:
             return 4;
-
-        case STORAGE_CONTROLLER_NVME:
-            return 3;
 
         case STORAGE_CONTROLLER_IDE:
             return 2;
@@ -145,6 +146,7 @@ void storage_init(void)
     }
 
     (void)ahci_init();
+    (void)nvme_init();
 }
 
 bool storage_controller_found(void)
@@ -366,8 +368,11 @@ void storage_print_controller(void)
         STORAGE_CONTROLLER_NVME
     )
     {
+        terminal_write("NVMe driver: ");
         terminal_write_line(
-            "NVMe driver not active in this build"
+            nvme_available() ?
+                "active" :
+                "controller found but initialization failed"
         );
     }
 }
