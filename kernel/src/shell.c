@@ -4,6 +4,7 @@
 #include "shell.h"
 
 #include "acpi.h"
+#include "ahci.h"
 #include "arp.h"
 #include "block_device.h"
 #include "compositor.h"
@@ -26,6 +27,7 @@
 #include "physical_memory.h"
 #include "pci.h"
 #include "process.h"
+#include "partition.h"
 #include "power.h"
 #include "rtc.h"
 #include "serial.h"
@@ -122,48 +124,78 @@ static bool split_first_argument(
 
     size_t input = 0;
 
-    while (
-        character_is_space(
-            arguments[input]
-        )
-    )
+    while (character_is_space(arguments[input]))
+    {
+        input++;
+    }
+
+    bool quoted = arguments[input] == '"';
+
+    if (quoted)
     {
         input++;
     }
 
     size_t output = 0;
 
-    while (
-        arguments[input] != '\0' &&
-        !character_is_space(
-            arguments[input]
-        )
-    )
+    while (arguments[input] != '\0')
     {
+        if (
+            (quoted && arguments[input] == '"') ||
+            (!quoted && character_is_space(arguments[input]))
+        )
+        {
+            break;
+        }
+
         if (output + 1 >= first_capacity)
         {
             return false;
         }
 
-        first[output] = arguments[input];
-        output++;
+        first[output++] = arguments[input++];
+    }
+
+    if (quoted)
+    {
+        if (arguments[input] != '"')
+        {
+            return false;
+        }
+
         input++;
     }
 
     first[output] = '\0';
 
-    while (
-        character_is_space(
-            arguments[input]
-        )
-    )
+    while (character_is_space(arguments[input]))
     {
         input++;
     }
 
     *remaining = &arguments[input];
-
     return output > 0;
+}
+
+static bool parse_single_argument(
+    const char *arguments,
+    char *value,
+    size_t capacity
+)
+{
+    const char *remaining;
+
+    if (!split_first_argument(
+            arguments,
+            value,
+            capacity,
+            &remaining
+        ))
+    {
+        return false;
+    }
+
+    return remaining[0] == '\0';
 }
 
 static bool parse_uint64(
@@ -385,6 +417,18 @@ static void command_storage(
     const char *arguments
 );
 
+static void command_ahci(
+    const char *arguments
+);
+
+static void command_ahcitest(
+    const char *arguments
+);
+
+static void command_partitions(
+    const char *arguments
+);
+
 static void command_disks(
     const char *arguments
 );
@@ -530,6 +574,22 @@ static void command_usbms(
 );
 
 static void command_fatinfo(
+    const char *arguments
+);
+
+static void command_mountusb(
+    const char *arguments
+);
+
+static void command_mountsata(
+    const char *arguments
+);
+
+static void command_umountusb(
+    const char *arguments
+);
+
+static void command_fatrwtest(
     const char *arguments
 );
 
@@ -706,6 +766,21 @@ static const shell_command_t commands[] = {
         "storage",
         "Show storage controller",
         command_storage
+    },
+    {
+        "ahci",
+        "Show AHCI controller and SATA ports",
+        command_ahci
+    },
+    {
+        "ahcitest",
+        "Test AHCI DMA read/write and restore",
+        command_ahcitest
+    },
+    {
+        "partitions",
+        "List detected MBR partitions",
+        command_partitions
     },
     {
         "disks",
@@ -891,6 +966,26 @@ static const shell_command_t commands[] = {
         "fatinfo",
         "Show mounted FAT filesystem status",
         command_fatinfo
+    },
+    {
+        "mountusb",
+        "Switch to the first USB FAT volume",
+        command_mountusb
+    },
+    {
+        "mountsata",
+        "Switch to the first AHCI FAT partition",
+        command_mountsata
+    },
+    {
+        "umountusb",
+        "Synchronize and safely unmount USB FAT",
+        command_umountusb
+    },
+    {
+        "fatrwtest",
+        "Test FAT create, resize, rename, move, and delete",
+        command_fatrwtest
     },
     {
         "net",
@@ -1434,6 +1529,35 @@ static void command_storage(
     storage_print_controller();
 }
 
+static void command_ahci(
+    const char *arguments
+)
+{
+    (void)arguments;
+    ahci_print_status();
+}
+
+static void command_ahcitest(
+    const char *arguments
+)
+{
+    (void)arguments;
+
+    terminal_write_line(
+        ahci_run_self_test() ?
+            "AHCI DMA read/write self-test: PASSED" :
+            "AHCI DMA read/write self-test: FAILED"
+    );
+}
+
+static void command_partitions(
+    const char *arguments
+)
+{
+    (void)arguments;
+    partition_print();
+}
+
 static void command_disks(
     const char *arguments
 )
@@ -1710,13 +1834,27 @@ static void command_ls(
     const char *arguments
 )
 {
-    const char *path =
-        arguments[0] == '\0' ?
-        "." :
-        arguments;
+    char parsed_path[VFS_PATH_MAX];
+    const char *path = ".";
 
-    vfs_node_t *directory =
-        vfs_open(path);
+    if (arguments[0] != '\0')
+    {
+        if (!parse_single_argument(
+                arguments,
+                parsed_path,
+                sizeof(parsed_path)
+            ))
+        {
+            terminal_write_line(
+                "Usage: ls [PATH]"
+            );
+            return;
+        }
+
+        path = parsed_path;
+    }
+
+    vfs_node_t *directory = vfs_open(path);
 
     if (directory == NULL)
     {
@@ -1726,10 +1864,7 @@ static void command_ls(
         return;
     }
 
-    if (
-        directory->type !=
-        VFS_NODE_DIRECTORY
-    )
+    if (directory->type != VFS_NODE_DIRECTORY)
     {
         terminal_write_line(
             "Not a directory"
@@ -1737,8 +1872,7 @@ static void command_ls(
         return;
     }
 
-    vfs_node_t *child =
-        directory->first_child;
+    vfs_node_t *child = directory->first_child;
 
     if (child == NULL)
     {
@@ -1748,39 +1882,24 @@ static void command_ls(
 
     while (child != NULL)
     {
-        if (
-            child->type ==
-            VFS_NODE_DIRECTORY
-        )
-        {
-            terminal_write("[DIR]  ");
-        }
-        else
-        {
-            terminal_write("[FILE] ");
-        }
+        terminal_write(
+            child->type == VFS_NODE_DIRECTORY ?
+                "[DIR]  " :
+                "[FILE] "
+        );
 
         terminal_write(child->name);
 
-        if (
-            child->type ==
-            VFS_NODE_FILE
-        )
+        if (child->type == VFS_NODE_FILE)
         {
             char size_text[21];
-
-            uint64_to_string(
-                child->size,
-                size_text
-            );
-
+            uint64_to_string(child->size, size_text);
             terminal_write(" (");
             terminal_write(size_text);
             terminal_write(" bytes)");
         }
 
         terminal_write_line("");
-
         child = child->next_sibling;
     }
 }
@@ -1789,7 +1908,13 @@ static void command_cd(
     const char *arguments
 )
 {
-    if (arguments[0] == '\0')
+    char path[VFS_PATH_MAX];
+
+    if (!parse_single_argument(
+            arguments,
+            path,
+            sizeof(path)
+        ))
     {
         terminal_write_line(
             "Usage: cd PATH"
@@ -1797,7 +1922,7 @@ static void command_cd(
         return;
     }
 
-    if (!vfs_change_directory(arguments))
+    if (!vfs_change_directory(path))
     {
         terminal_write_line(
             "Directory not found"
@@ -1833,7 +1958,13 @@ static void command_cat(
     const char *arguments
 )
 {
-    if (arguments[0] == '\0')
+    char path[VFS_PATH_MAX];
+
+    if (!parse_single_argument(
+            arguments,
+            path,
+            sizeof(path)
+        ))
     {
         terminal_write_line(
             "Usage: cat PATH"
@@ -1841,8 +1972,7 @@ static void command_cat(
         return;
     }
 
-    vfs_node_t *file =
-        vfs_open(arguments);
+    vfs_node_t *file = vfs_open(path);
 
     if (file == NULL)
     {
@@ -1866,13 +1996,12 @@ static void command_cat(
 
     while (offset < file->size)
     {
-        size_t count =
-            vfs_read(
-                file,
-                offset,
-                buffer,
-                sizeof(buffer) - 1
-            );
+        size_t count = vfs_read(
+            file,
+            offset,
+            buffer,
+            sizeof(buffer) - 1
+        );
 
         if (count == 0)
         {
@@ -1880,17 +2009,12 @@ static void command_cat(
         }
 
         buffer[count] = '\0';
-        last_character =
-            buffer[count - 1];
-
+        last_character = buffer[count - 1];
         terminal_write(buffer);
         offset += count;
     }
 
-    if (
-        file->size == 0 ||
-        last_character != '\n'
-    )
+    if (file->size == 0 || last_character != '\n')
     {
         terminal_write_line("");
     }
@@ -1900,7 +2024,13 @@ static void command_mkdir(
     const char *arguments
 )
 {
-    if (arguments[0] == '\0')
+    char path[VFS_PATH_MAX];
+
+    if (!parse_single_argument(
+            arguments,
+            path,
+            sizeof(path)
+        ))
     {
         terminal_write_line(
             "Usage: mkdir PATH"
@@ -1908,7 +2038,7 @@ static void command_mkdir(
         return;
     }
 
-    if (!vfs_make_directory(arguments))
+    if (!vfs_make_directory(path))
     {
         terminal_write_line(
             "Unable to create directory"
@@ -1960,7 +2090,13 @@ static void command_rm(
     const char *arguments
 )
 {
-    if (arguments[0] == '\0')
+    char path[VFS_PATH_MAX];
+
+    if (!parse_single_argument(
+            arguments,
+            path,
+            sizeof(path)
+        ))
     {
         terminal_write_line(
             "Usage: rm PATH"
@@ -1969,7 +2105,7 @@ static void command_rm(
     }
 
     terminal_write_line(
-        vfs_remove(arguments, true) ?
+        vfs_remove(path, true) ?
             "Removed" :
             "Unable to remove path"
     );
@@ -1980,16 +2116,21 @@ static void command_rename(
 )
 {
     char path[VFS_PATH_MAX];
-    const char *new_name;
+    char new_name[VFS_NAME_MAX + 1];
+    const char *remaining;
 
     if (
         !split_first_argument(
             arguments,
             path,
             sizeof(path),
-            &new_name
+            &remaining
         ) ||
-        new_name[0] == '\0'
+        !parse_single_argument(
+            remaining,
+            new_name,
+            sizeof(new_name)
+        )
     )
     {
         terminal_write_line(
@@ -2010,16 +2151,21 @@ static void command_cp(
 )
 {
     char source[VFS_PATH_MAX];
-    const char *destination;
+    char destination[VFS_PATH_MAX];
+    const char *remaining;
 
     if (
         !split_first_argument(
             arguments,
             source,
             sizeof(source),
-            &destination
+            &remaining
         ) ||
-        destination[0] == '\0'
+        !parse_single_argument(
+            remaining,
+            destination,
+            sizeof(destination)
+        )
     )
     {
         terminal_write_line(
@@ -2040,16 +2186,21 @@ static void command_mv(
 )
 {
     char source[VFS_PATH_MAX];
-    const char *destination;
+    char destination[VFS_PATH_MAX];
+    const char *remaining;
 
     if (
         !split_first_argument(
             arguments,
             source,
             sizeof(source),
-            &destination
+            &remaining
         ) ||
-        destination[0] == '\0'
+        !parse_single_argument(
+            remaining,
+            destination,
+            sizeof(destination)
+        )
     )
     {
         terminal_write_line(
@@ -2851,6 +3002,68 @@ static void command_fatinfo(
     fat_fs_print_status();
 }
 
+static void command_mountusb(
+    const char *arguments
+)
+{
+    (void)arguments;
+
+    if (fat_fs_mounted())
+    {
+        (void)fat_fs_unmount();
+    }
+
+    terminal_write_line(
+        fat_fs_mount_first_usb() ?
+            "USB FAT volume mounted at /media/usb" :
+            "Unable to mount USB FAT volume"
+    );
+}
+
+static void command_mountsata(
+    const char *arguments
+)
+{
+    (void)arguments;
+
+    if (fat_fs_mounted())
+    {
+        (void)fat_fs_unmount();
+    }
+
+    terminal_write_line(
+        fat_fs_mount_first_sata() ?
+            "AHCI FAT volume mounted at /media/sata" :
+            "Unable to mount AHCI FAT volume"
+    );
+}
+
+static void command_umountusb(
+    const char *arguments
+)
+{
+    (void)arguments;
+
+    terminal_write_line(
+        fat_fs_unmount() ?
+            "FAT volume synchronized and unmounted" :
+            "Unable to unmount FAT volume"
+    );
+}
+
+static void command_fatrwtest(
+    const char *arguments
+)
+{
+    (void)arguments;
+
+    terminal_write_line(
+        fat_fs_run_write_test() ?
+            "FAT complete read/write test: PASSED" :
+            "FAT complete read/write test: FAILED"
+    );
+}
+
 static void command_net(
     const char *arguments
 )
@@ -3418,10 +3631,14 @@ static void command_sync(
 {
     (void)arguments;
 
+    bool system_synced = latteros_fs_sync();
+    bool fat_synced =
+        !fat_fs_mounted() || fat_fs_sync();
+
     terminal_write_line(
-        latteros_fs_sync() ?
-            "Persistent filesystem synchronized" :
-            "Persistent filesystem unavailable"
+        system_synced && fat_synced ?
+            "All mounted filesystems synchronized" :
+            "One or more filesystems could not be synchronized"
     );
 }
 

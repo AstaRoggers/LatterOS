@@ -4,6 +4,7 @@
 #include <limine.h>
 
 #include "acpi.h"
+#include "ahci.h"
 #include "autotest.h"
 #include "dhcp.h"
 #include "dns.h"
@@ -28,6 +29,7 @@
 #include "page_allocator.h"
 #include "pci.h"
 #include "physical_memory.h"
+#include "partition.h"
 #include "pic.h"
 #include "process.h"
 #include "ramfs.h"
@@ -408,10 +410,11 @@ void kmain(void)
     klogf(
         KLOG_INFO,
         "pci",
-        "devices=%u storage=%s",
+        "devices=%u storage=%s ahci-disks=%u",
         (unsigned int)pci_device_count(),
         storage_controller_found() ?
-            "detected" : "not detected"
+            "detected" : "not detected",
+        (unsigned int)ahci_device_count()
     );
 
     boot_screen_progress(52, "Mounting storage");
@@ -459,9 +462,10 @@ void kmain(void)
         klogf(
             KLOG_INFO,
             "filesystem",
-            "LatterOS filesystem mounted; entries=%u used=%llu bytes",
+            "LatterOS filesystem mounted; entries=%u used=%llu bytes partitions=%u",
             (unsigned int)latteros_fs_entry_count(),
-            (unsigned long long)latteros_fs_used_bytes()
+            (unsigned long long)latteros_fs_used_bytes(),
+            (unsigned int)partition_count()
         );
     }
 

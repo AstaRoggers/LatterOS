@@ -712,6 +712,35 @@ bool vfs_mount_at(
     );
 }
 
+vfs_node_t *vfs_detach_mount(const char *path)
+{
+    vfs_node_t *node = vfs_open(path);
+
+    if (
+        node == NULL ||
+        node->parent == NULL ||
+        !mounted_root(node)
+    )
+    {
+        return NULL;
+    }
+
+    if (node_is_ancestor(node, current_directory))
+    {
+        current_directory = node->parent;
+    }
+
+    vfs_node_t *parent = node->parent;
+
+    if (!detach_child(parent, node))
+    {
+        return NULL;
+    }
+
+    node->parent = NULL;
+    return node;
+}
+
 bool vfs_change_directory(const char *path)
 {
     vfs_node_t *node =

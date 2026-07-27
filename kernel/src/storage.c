@@ -1,5 +1,6 @@
 #include "storage.h"
 
+#include "ahci.h"
 #include "ata.h"
 #include "block_device.h"
 #include "terminal.h"
@@ -67,13 +68,13 @@ static uint8_t controller_priority(
 {
     switch (type)
     {
-        case STORAGE_CONTROLLER_IDE:
+        case STORAGE_CONTROLLER_AHCI:
             return 4;
 
-        case STORAGE_CONTROLLER_AHCI:
+        case STORAGE_CONTROLLER_NVME:
             return 3;
 
-        case STORAGE_CONTROLLER_NVME:
+        case STORAGE_CONTROLLER_IDE:
             return 2;
 
         case STORAGE_CONTROLLER_OTHER:
@@ -124,16 +125,26 @@ void storage_init(void)
         selected_priority = priority;
     }
 
-    if (
-        selected_type ==
-        STORAGE_CONTROLLER_IDE &&
-        ata_init()
-    )
+    /*
+     * Keep the legacy IDE disk first so the existing LatterOS system
+     * partition remains the primary block device. AHCI disks are then
+     * registered as additional modern-storage devices.
+     */
+    const pci_device_t *ide_controller =
+        pci_find_class(
+            PCI_CLASS_STORAGE,
+            PCI_SUBCLASS_IDE,
+            0
+        );
+
+    if (ide_controller != NULL && ata_init())
     {
         (void)block_device_register(
             ata_block_device()
         );
     }
+
+    (void)ahci_init();
 }
 
 bool storage_controller_found(void)
@@ -343,8 +354,11 @@ void storage_print_controller(void)
         STORAGE_CONTROLLER_AHCI
     )
     {
+        terminal_write("AHCI driver: ");
         terminal_write_line(
-            "AHCI driver not active in this build"
+            ahci_available() ?
+                "active" :
+                "controller found but initialization failed"
         );
     }
     else if (

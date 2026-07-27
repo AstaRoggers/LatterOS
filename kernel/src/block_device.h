@@ -4,7 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define BLOCK_DEVICE_MAX 8
+#define BLOCK_DEVICE_MAX 16
 
 typedef bool (*block_read_function_t)(
     void *context,

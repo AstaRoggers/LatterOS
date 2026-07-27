@@ -109,6 +109,8 @@ bool vfs_mount_at(
     vfs_node_t *filesystem_root
 );
 
+vfs_node_t *vfs_detach_mount(const char *path);
+
 vfs_node_t *vfs_root(void);
 vfs_node_t *vfs_current_directory(void);
 
