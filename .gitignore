@@ -5,9 +5,12 @@
 
 # Generated disk images
 *.img
+<<<<<<< HEAD
 
 # Generated disk images
 *.img
 
 # Generated disk images
 *.img
+=======
+>>>>>>> c175dc4add402b8ed23b4911799eeadf96c44341
