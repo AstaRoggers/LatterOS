@@ -6,6 +6,7 @@
 
 bool fat_fs_mount_first_usb(void);
 bool fat_fs_mount_first_sata(void);
+bool fat_fs_mount_first_nvme(void);
 bool fat_fs_mount_device_index(
     uint32_t device_index,
     const char *mount_path

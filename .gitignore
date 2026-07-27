@@ -2,3 +2,9 @@
 /edk2-ovmf-bins
 *.iso
 *.hdd
+
+# Generated disk images
+*.img
+
+# Generated disk images
+*.img

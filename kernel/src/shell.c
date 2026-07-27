@@ -23,6 +23,7 @@
 #include "latteros_fs.h"
 #include "mouse.h"
 #include "network.h"
+#include "nvme.h"
 #include "page_allocator.h"
 #include "physical_memory.h"
 #include "pci.h"
@@ -425,6 +426,14 @@ static void command_ahcitest(
     const char *arguments
 );
 
+static void command_nvme(
+    const char *arguments
+);
+
+static void command_nvmetest(
+    const char *arguments
+);
+
 static void command_partitions(
     const char *arguments
 );
@@ -582,6 +591,10 @@ static void command_mountusb(
 );
 
 static void command_mountsata(
+    const char *arguments
+);
+
+static void command_mountnvme(
     const char *arguments
 );
 
@@ -778,8 +791,18 @@ static const shell_command_t commands[] = {
         command_ahcitest
     },
     {
+        "nvme",
+        "Show NVMe controller and namespaces",
+        command_nvme
+    },
+    {
+        "nvmetest",
+        "Test NVMe read/write/flush and restore",
+        command_nvmetest
+    },
+    {
         "partitions",
-        "List detected MBR partitions",
+        "List detected MBR and GPT partitions",
         command_partitions
     },
     {
@@ -976,6 +999,11 @@ static const shell_command_t commands[] = {
         "mountsata",
         "Switch to the first AHCI FAT partition",
         command_mountsata
+    },
+    {
+        "mountnvme",
+        "Switch to the first NVMe FAT partition",
+        command_mountnvme
     },
     {
         "umountusb",
@@ -1547,6 +1575,27 @@ static void command_ahcitest(
         ahci_run_self_test() ?
             "AHCI DMA read/write self-test: PASSED" :
             "AHCI DMA read/write self-test: FAILED"
+    );
+}
+
+static void command_nvme(
+    const char *arguments
+)
+{
+    (void)arguments;
+    nvme_print_status();
+}
+
+static void command_nvmetest(
+    const char *arguments
+)
+{
+    (void)arguments;
+
+    terminal_write_line(
+        nvme_run_self_test() ?
+            "NVMe read/write/flush self-test: PASSED" :
+            "NVMe read/write/flush self-test: FAILED"
     );
 }
 
@@ -3035,6 +3084,24 @@ static void command_mountsata(
         fat_fs_mount_first_sata() ?
             "AHCI FAT volume mounted at /media/sata" :
             "Unable to mount AHCI FAT volume"
+    );
+}
+
+static void command_mountnvme(
+    const char *arguments
+)
+{
+    (void)arguments;
+
+    if (fat_fs_mounted())
+    {
+        (void)fat_fs_unmount();
+    }
+
+    terminal_write_line(
+        fat_fs_mount_first_nvme() ?
+            "NVMe FAT volume mounted at /media/nvme" :
+            "Unable to mount NVMe FAT volume"
     );
 }
 

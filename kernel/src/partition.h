@@ -6,13 +6,14 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define PARTITION_MAX_COUNT 16
+#define PARTITION_MAX_COUNT 24
 #define PARTITION_TYPE_LATTEROS_FS 0xDA
 #define PARTITION_TYPE_LATTERFS PARTITION_TYPE_LATTEROS_FS
 
 typedef enum
 {
-    PARTITION_SCHEME_MBR
+    PARTITION_SCHEME_MBR,
+    PARTITION_SCHEME_GPT
 } partition_scheme_t;
 
 typedef struct
@@ -22,6 +23,9 @@ typedef struct
     uint32_t number;
     partition_scheme_t scheme;
     uint8_t type;
+    uint8_t type_guid[16];
+    uint8_t unique_guid[16];
+    char label[48];
     bool bootable;
     uint64_t start_lba;
     uint64_t sector_count;
