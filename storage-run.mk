@@ -1,6 +1,6 @@
 DISK_IMAGE := latteros-test-disk.img
 USB_DISK_IMAGE := latteros-usb-complete.img
-USB_DISK_BUILDER := make-usb-complete.py
+USB_DISK_BUILDER := make-usb-fat32-unicode.py
 SATA_DISK_IMAGE := latteros-sata-ahci.img
 SATA_DISK_BUILDER := make-sata-ahci.py
 NVME_DISK_IMAGE := latteros-nvme-gpt.img
@@ -60,6 +60,7 @@ run: $(DISK_IMAGE) $(USB_DISK_IMAGE) $(SATA_DISK_IMAGE) $(NVME_DISK_IMAGE)
 		-boot d \
 		-drive file=$(DISK_IMAGE),format=raw,if=ide,index=0,media=disk
 
-rebuild: $(DISK_IMAGE) $(USB_DISK_IMAGE) $(SATA_DISK_IMAGE) $(NVME_DISK_IMAGE)
+rebuild: $(DISK_IMAGE) $(SATA_DISK_IMAGE) $(NVME_DISK_IMAGE)
 	$(MAKE) -f GNUmakefile clean
+	rm -f $(USB_DISK_IMAGE)
 	$(MAKE) -f storage-run.mk run

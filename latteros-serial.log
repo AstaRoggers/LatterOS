@@ -1,7 +1,7 @@
 [000001] INFO boot: LatterOS starting; framebuffer=1280x800 pitch=5120 serial=ready
 [000002] INFO cpu: GDT and IDT initialized
 [000003] INFO acpi: tables=ready root=RSDT cpus=4 ioapics=1
-[000004] INFO memory: usable=2076120 KiB pages=519030 free=262143
+[000004] INFO memory: usable=2075820 KiB pages=518955 free=262143
 [000005] INFO process: Process scheduler initialized
 [000006] INFO pci: devices=9 storage=detected ahci-disks=1
 [000007] INFO filesystem: LatterOS filesystem mounted; entries=5 used=73 bytes partitions=3
@@ -13,5 +13,3 @@
 [000013] INFO timer: PIT configured at 1000 Hz
 [000014] INFO smp: discovered=4 online=4 mode=x2APIC ap-workers=3
 [000015] INFO desktop: Desktop startup requested
-[000016] INFO usb-hotplug: event=1 links=3 devices=3 storage=0 mounted=no hub-scans=8 failures=0
-[000017] INFO usb-hotplug: event=2 links=4 devices=4 storage=1 mounted=yes hub-scans=8 failures=0

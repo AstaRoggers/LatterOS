@@ -5,8 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define VFS_NAME_MAX 31
-#define VFS_PATH_MAX 256
+#define VFS_NAME_MAX 767
+#define VFS_PATH_MAX 4096
 
 #define VFS_MODE_OWNER_READ    0400U
 #define VFS_MODE_OWNER_WRITE   0200U
@@ -18,8 +18,8 @@
 #define VFS_MODE_OTHER_WRITE   0002U
 #define VFS_MODE_OTHER_EXECUTE 0001U
 
-#define VFS_MODE_FILE_DEFAULT      0644U
-#define VFS_MODE_DIRECTORY_DEFAULT 0755U
+#define VFS_MODE_FILE_DEFAULT       0644U
+#define VFS_MODE_DIRECTORY_DEFAULT  0755U
 #define VFS_MODE_EXECUTABLE_DEFAULT 0755U
 
 #define VFS_ACCESS_READ    0x01U
@@ -104,12 +104,15 @@ struct vfs_node
 void vfs_init(void);
 
 bool vfs_mount_root(vfs_node_t *root);
+
 bool vfs_mount_at(
     const char *path,
     vfs_node_t *filesystem_root
 );
 
-vfs_node_t *vfs_detach_mount(const char *path);
+vfs_node_t *vfs_detach_mount(
+    const char *path
+);
 
 vfs_node_t *vfs_root(void);
 vfs_node_t *vfs_current_directory(void);

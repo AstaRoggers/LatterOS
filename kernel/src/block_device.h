@@ -20,7 +20,9 @@ typedef bool (*block_write_function_t)(
     const void *buffer
 );
 
-typedef struct
+typedef struct block_device block_device_t;
+
+struct block_device
 {
     const char *name;
     uint32_t sector_size;
@@ -33,7 +35,7 @@ typedef struct
     void *context;
     block_read_function_t read;
     block_write_function_t write;
-} block_device_t;
+};
 
 void block_device_init(void);
 
@@ -57,6 +59,16 @@ const block_device_t *block_device_find_context(
 uint32_t block_device_unregister_prefix(
     const char *name_prefix
 );
+
+bool block_device_sync(
+    const block_device_t *device
+);
+
+bool block_device_sync_prefix(
+    const char *name_prefix
+);
+
+bool block_device_sync_all(void);
 
 bool block_device_read(
     const block_device_t *device,

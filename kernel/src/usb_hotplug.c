@@ -1,5 +1,6 @@
 #include "usb_hotplug.h"
 
+#include "block_cache.h"
 #include "block_device.h"
 #include "fat_fs.h"
 #include "irq.h"
@@ -106,6 +107,15 @@ static void handle_topology_change(
     bool inserted =
         current_connections > previous_connections;
 
+    /*
+     * Flush all dirty USB cache entries while the old device is still
+     * registered. On a hard unplug this may fail, but periodic flushing
+     * normally leaves at most one second of dirty data outstanding.
+     */
+    (void)block_device_sync_prefix(
+        "USB mass storage"
+    );
+
     if (usb_fat_is_mounted())
     {
         (void)fat_fs_unmount();
@@ -151,10 +161,13 @@ static void handle_topology_change(
 
     refresh_observed_topology();
 
+    block_cache_stats_t cache = {0};
+    block_cache_get_stats(&cache);
+
     klogf(
         KLOG_INFO,
         "usb-hotplug",
-        "event=%llu links=%u devices=%u storage=%u mounted=%s hub-scans=%u failures=%u",
+        "event=%llu links=%u devices=%u storage=%u mounted=%s hub-scans=%u failures=%u cache-valid=%u cache-dirty=%u cache-flushes=%llu cache-errors=%llu",
         (unsigned long long)event_count,
         (unsigned int)
             observed_topology.connected_points,
@@ -164,7 +177,11 @@ static void handle_topology_change(
         (unsigned int)
             observed_topology.hub_ports_scanned,
         (unsigned int)
-            observed_topology.query_failures
+            observed_topology.query_failures,
+        (unsigned int)cache.valid_entries,
+        (unsigned int)cache.dirty_entries,
+        (unsigned long long)cache.flushes,
+        (unsigned long long)cache.flush_failures
     );
 }
 

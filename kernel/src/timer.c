@@ -1,5 +1,6 @@
 #include "timer.h"
 
+#include "block_cache.h"
 #include "io.h"
 #include "irq.h"
 #include "usb_hotplug.h"
@@ -68,6 +69,7 @@ void timer_init(uint32_t frequency)
         (uint8_t)((divisor >> 8) & 0xFF)
     );
 
+    (void)block_cache_start_worker();
     (void)usb_hotplug_init();
 }
 

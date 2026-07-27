@@ -1,7 +1,9 @@
 #include "block_device.h"
 
+#include "block_cache.h"
 #include "spinlock.h"
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -89,6 +91,7 @@ void block_device_init(void)
 {
     device_slots = 0;
     spinlock_init(&registry_lock);
+    block_cache_init();
 
     for (
         uint32_t index = 0;
@@ -172,6 +175,10 @@ bool block_device_register(
         selected = device_slots++;
     }
 
+    block_cache_invalidate_device(
+        &devices[selected]
+    );
+
     devices[selected] = *device;
     devices[selected].io_references = 0;
     devices[selected].removable =
@@ -180,6 +187,7 @@ bool block_device_register(
             device->name,
             "USB mass storage"
         );
+
     __atomic_store_n(
         &devices[selected].online,
         true,
@@ -288,6 +296,94 @@ const block_device_t *block_device_find_context(
     return NULL;
 }
 
+bool block_device_sync(
+    const block_device_t *device
+)
+{
+    if (device == NULL)
+    {
+        return false;
+    }
+
+    if (!block_cache_device_supported(device))
+    {
+        return device_online(device);
+    }
+
+    return block_cache_flush_device(device);
+}
+
+bool block_device_sync_prefix(
+    const char *name_prefix
+)
+{
+    if (
+        name_prefix == NULL ||
+        name_prefix[0] == '\0'
+    )
+    {
+        return false;
+    }
+
+    bool matched = false;
+    bool success = true;
+
+    for (
+        uint32_t index = 0;
+        index < device_slots;
+        index++
+    )
+    {
+        const block_device_t *device =
+            block_device_get(index);
+
+        if (
+            device == NULL ||
+            !string_starts_with(
+                device->name,
+                name_prefix
+            )
+        )
+        {
+            continue;
+        }
+
+        matched = true;
+
+        if (!block_device_sync(device))
+        {
+            success = false;
+        }
+    }
+
+    return matched && success;
+}
+
+bool block_device_sync_all(void)
+{
+    bool success = true;
+
+    for (
+        uint32_t index = 0;
+        index < device_slots;
+        index++
+    )
+    {
+        const block_device_t *device =
+            block_device_get(index);
+
+        if (
+            device != NULL &&
+            !block_device_sync(device)
+        )
+        {
+            success = false;
+        }
+    }
+
+    return success;
+}
+
 uint32_t block_device_unregister_prefix(
     const char *name_prefix
 )
@@ -300,14 +396,16 @@ uint32_t block_device_unregister_prefix(
         return 0;
     }
 
+    block_device_t *selected[BLOCK_DEVICE_MAX];
+    uint32_t selected_count = 0;
+
     uint64_t flags =
         spinlock_lock_irqsave(&registry_lock);
 
-    uint32_t removed = 0;
-
     for (
         uint32_t index = 0;
-        index < device_slots;
+        index < device_slots &&
+            selected_count < BLOCK_DEVICE_MAX;
         index++
     )
     {
@@ -319,12 +417,8 @@ uint32_t block_device_unregister_prefix(
             )
         )
         {
-            __atomic_store_n(
-                &devices[index].online,
-                false,
-                __ATOMIC_RELEASE
-            );
-            removed++;
+            selected[selected_count++] =
+                &devices[index];
         }
     }
 
@@ -335,31 +429,55 @@ uint32_t block_device_unregister_prefix(
 
     for (
         uint32_t index = 0;
-        index < device_slots;
+        index < selected_count;
         index++
     )
     {
-        if (
-            !device_online(&devices[index]) &&
-            string_starts_with(
-                devices[index].name,
-                name_prefix
-            )
-        )
-        {
-            while (
-                __atomic_load_n(
-                    &devices[index].io_references,
-                    __ATOMIC_ACQUIRE
-                ) != 0
-            )
-            {
-                __asm__ volatile("pause");
-            }
-        }
+        (void)block_device_sync(selected[index]);
     }
 
-    return removed;
+    flags = spinlock_lock_irqsave(&registry_lock);
+
+    for (
+        uint32_t index = 0;
+        index < selected_count;
+        index++
+    )
+    {
+        __atomic_store_n(
+            &selected[index]->online,
+            false,
+            __ATOMIC_RELEASE
+        );
+    }
+
+    spinlock_unlock_irqrestore(
+        &registry_lock,
+        flags
+    );
+
+    for (
+        uint32_t index = 0;
+        index < selected_count;
+        index++
+    )
+    {
+        while (
+            __atomic_load_n(
+                &selected[index]->io_references,
+                __ATOMIC_ACQUIRE
+            ) != 0
+        )
+        {
+            __asm__ volatile("pause");
+        }
+
+        block_cache_invalidate_device(
+            selected[index]
+        );
+    }
+
+    return selected_count;
 }
 
 bool block_device_read(
@@ -382,12 +500,26 @@ bool block_device_read(
         return false;
     }
 
-    bool success = device->read(
-        device->context,
-        lba,
-        sector_count,
-        buffer
-    );
+    bool success;
+
+    if (block_cache_device_supported(device))
+    {
+        success = block_cache_read(
+            device,
+            lba,
+            sector_count,
+            buffer
+        );
+    }
+    else
+    {
+        success = device->read(
+            device->context,
+            lba,
+            sector_count,
+            buffer
+        );
+    }
 
     device_release(device);
     return success;
@@ -414,12 +546,26 @@ bool block_device_write(
         return false;
     }
 
-    bool success = device->write(
-        device->context,
-        lba,
-        sector_count,
-        buffer
-    );
+    bool success;
+
+    if (block_cache_device_supported(device))
+    {
+        success = block_cache_write(
+            device,
+            lba,
+            sector_count,
+            buffer
+        );
+    }
+    else
+    {
+        success = device->write(
+            device->context,
+            lba,
+            sector_count,
+            buffer
+        );
+    }
 
     device_release(device);
     return success;
