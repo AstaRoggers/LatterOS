@@ -26,6 +26,9 @@ typedef struct
     uint32_t sector_size;
     uint64_t sector_count;
     bool writable;
+    bool online;
+    bool removable;
+    volatile uint32_t io_references;
 
     void *context;
     block_read_function_t read;
@@ -39,12 +42,21 @@ bool block_device_register(
 );
 
 uint32_t block_device_count(void);
+uint32_t block_device_online_count(void);
 
 const block_device_t *block_device_get(
     uint32_t index
 );
 
 const block_device_t *block_device_primary(void);
+
+const block_device_t *block_device_find_context(
+    const void *context
+);
+
+uint32_t block_device_unregister_prefix(
+    const char *name_prefix
+);
 
 bool block_device_read(
     const block_device_t *device,

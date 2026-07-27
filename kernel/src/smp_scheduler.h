@@ -20,6 +20,12 @@ typedef uint64_t (*smp_job_function_t)(
     void *argument
 );
 
+typedef void (*smp_user_completion_t)(
+    void *owner,
+    int64_t status,
+    uint32_t cpu_index
+);
+
 typedef enum
 {
     SMP_JOB_IDLE,
@@ -62,6 +68,11 @@ void smp_scheduler_exit_current(
     uint64_t result
 );
 
+cpu_context_t *smp_scheduler_exit_current_user(
+    cpu_context_t *context,
+    int64_t status
+);
+
 bool smp_scheduler_submit(
     uint32_t cpu_index,
     smp_job_function_t function,
@@ -74,6 +85,37 @@ bool smp_scheduler_submit_any(
     void *argument,
     uint32_t *cpu_index,
     uint64_t *job_id
+);
+
+bool smp_scheduler_submit_user(
+    uint32_t cpu_index,
+    uint64_t entry_point,
+    uint64_t user_stack_top,
+    uint64_t initial_argument,
+    uint64_t page_table_root,
+    uint32_t process_slot,
+    uint64_t pid,
+    void *owner,
+    smp_user_completion_t completion,
+    uint64_t *thread_id
+);
+
+bool smp_scheduler_submit_process_any(
+    cpu_context_t *context,
+    uint64_t page_table_root,
+    uint64_t kernel_stack_top,
+    uint32_t process_slot,
+    uint64_t pid,
+    void *owner,
+    smp_user_completion_t completion,
+    uint32_t *cpu_index,
+    uint64_t *thread_id
+);
+
+bool smp_scheduler_request_process_stop(
+    uint32_t process_slot,
+    uint64_t pid,
+    int64_t status
 );
 
 uint32_t smp_scheduler_start_benchmark(
@@ -91,6 +133,10 @@ uint64_t smp_scheduler_current_thread_id(
 );
 
 bool smp_scheduler_preemption_enabled(
+    uint32_t cpu_index
+);
+
+uint64_t smp_scheduler_cpu_sequence(
     uint32_t cpu_index
 );
 

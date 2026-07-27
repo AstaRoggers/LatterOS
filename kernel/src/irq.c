@@ -3,10 +3,12 @@
 #include "ioapic.h"
 #include "lapic.h"
 #include "panic.h"
+#include "paging.h"
 #include "pic.h"
 #include "process.h"
 #include "syscall.h"
 #include "smp_scheduler.h"
+#include "smp_user.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -20,6 +22,7 @@
 #define SMP_IPI_VECTOR   SMP_SCHEDULER_IPI_VECTOR
 #define SMP_YIELD_VECTOR SMP_SCHEDULER_YIELD_VECTOR
 #define SMP_TIMER_VECTOR SMP_SCHEDULER_TIMER_VECTOR
+#define TLB_IPI_VECTOR   PAGING_TLB_IPI_VECTOR
 #define SPURIOUS_VECTOR  255
 
 static irq_handler_t irq_handlers[IRQ_COUNT];
@@ -156,6 +159,13 @@ cpu_context_t *interrupt_dispatch(
 
     if (vector == SYSCALL_VECTOR)
     {
+        if (smp_user_is_current())
+        {
+            return smp_user_syscall_dispatch(
+                context
+            );
+        }
+
         return syscall_dispatch(context);
     }
 
@@ -183,6 +193,18 @@ cpu_context_t *interrupt_dispatch(
         return smp_scheduler_handle_yield(
             context
         );
+    }
+
+    if (vector == TLB_IPI_VECTOR)
+    {
+        paging_handle_tlb_ipi();
+
+        if (use_lapic)
+        {
+            lapic_send_eoi();
+        }
+
+        return context;
     }
 
     if (vector == SMP_TIMER_VECTOR)
@@ -216,6 +238,16 @@ cpu_context_t *interrupt_dispatch(
                 __asm__ volatile(
                     "mov %%cr2, %0"
                     : "=r"(fault_address)
+                );
+            }
+
+            if (smp_user_is_current())
+            {
+                return smp_user_fault_from_exception(
+                    context,
+                    vector,
+                    context->error_code,
+                    fault_address
                 );
             }
 

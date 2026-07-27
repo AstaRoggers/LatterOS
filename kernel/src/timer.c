@@ -2,6 +2,7 @@
 
 #include "io.h"
 #include "irq.h"
+#include "usb_hotplug.h"
 
 #include <stdint.h>
 
@@ -66,6 +67,8 @@ void timer_init(uint32_t frequency)
         PIT_CHANNEL_0,
         (uint8_t)((divisor >> 8) & 0xFF)
     );
+
+    (void)usb_hotplug_init();
 }
 
 uint64_t timer_ticks(void)

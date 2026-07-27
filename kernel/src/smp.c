@@ -6,6 +6,7 @@
 #include "irq.h"
 #include "kstdio.h"
 #include "lapic.h"
+#include "paging.h"
 #include "smp_scheduler.h"
 
 #include <stdbool.h>
@@ -189,6 +190,7 @@ static __attribute__((noreturn)) void smp_ap_entry(
         false
     );
 
+    paging_register_current_cpu();
     smp_scheduler_cpu_online(index);
 
     bool preemption_ready =
@@ -597,7 +599,7 @@ void smp_print_status(void)
     }
 
     kprintf(
-        "Scheduler: BSP process scheduler + AP stackful kernel threads; user processes remain BSP-only\n"
+        "Scheduler: shared process table + AP preemptive kernel threads + AP ring-3 user processes\n"
     );
 
     kprintf(

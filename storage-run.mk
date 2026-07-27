@@ -41,11 +41,13 @@ run: $(DISK_IMAGE) $(USB_DISK_IMAGE) $(SATA_DISK_IMAGE) $(NVME_DISK_IMAGE)
 		-m 2G \
 		-audiodev dsound,id=audio0 \
 		-serial file:latteros-serial.log \
+		-monitor stdio \
 		-usb \
-		-device usb-kbd,id=latteros-kbd \
-		-device usb-mouse,id=latteros-mouse \
+		-device usb-hub,id=latteros-usb-hub,bus=usb-bus.0,port=1 \
+		-device usb-kbd,id=latteros-kbd,bus=usb-bus.0,port=1.1 \
+		-device usb-mouse,id=latteros-mouse,bus=usb-bus.0,port=1.2 \
 		-drive if=none,id=usbdisk,file=$(USB_DISK_IMAGE),format=raw \
-		-device usb-storage,drive=usbdisk,removable=true \
+		-device usb-storage,id=latteros-usb-storage,drive=usbdisk,bus=usb-bus.0,port=1.3,removable=on \
 		-device ich9-ahci,id=ahci \
 		-drive if=none,id=satadisk,file=$(SATA_DISK_IMAGE),format=raw \
 		-device ide-hd,drive=satadisk,bus=ahci.0,unit=0 \

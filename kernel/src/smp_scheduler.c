@@ -4,7 +4,9 @@
 #include "gdt.h"
 #include "kstdio.h"
 #include "lapic.h"
+#include "paging.h"
 #include "smp.h"
+#include "smp_user.h"
 #include "spinlock.h"
 
 #include <stdbool.h>
@@ -15,6 +17,13 @@
 #define MAX_BENCHMARK_ITERATIONS     250000000ULL
 #define INITIAL_RFLAGS               0x202ULL
 #define SMP_THREAD_NONE              UINT32_MAX
+
+typedef enum
+{
+    SMP_THREAD_KIND_KERNEL,
+    SMP_THREAD_KIND_USER,
+    SMP_THREAD_KIND_PROCESS
+} smp_thread_kind_t;
 
 typedef enum
 {
@@ -33,11 +42,22 @@ typedef struct
     uint32_t last_cpu;
 
     smp_thread_state_t state;
+    smp_thread_kind_t kind;
     bool queued;
 
     smp_job_function_t function;
     void *argument;
     cpu_context_t *context;
+
+    uint64_t page_table_root;
+    uint64_t kernel_stack_top;
+    uint64_t user_pid;
+    uint32_t user_process_slot;
+    uint32_t reserved0;
+    void *owner;
+    smp_user_completion_t completion;
+    bool stop_requested;
+    int64_t stop_status;
 
     uint64_t result;
     uint64_t scheduler_ticks;
@@ -60,6 +80,7 @@ typedef struct
 
     uint32_t current_thread;
     cpu_context_t *idle_context;
+    uint64_t idle_kernel_stack_top;
 
     bool online;
     bool preemption_enabled;
@@ -69,7 +90,11 @@ typedef struct
     uint64_t last_result;
 
     uint64_t submitted_jobs;
+    uint64_t submitted_user_processes;
+    uint64_t submitted_process_table;
     uint64_t completed_jobs;
+    uint64_t completed_user_processes;
+    uint64_t completed_process_table;
     uint64_t rejected_jobs;
     uint64_t stolen_in;
     uint64_t stolen_out;
@@ -103,6 +128,8 @@ static benchmark_argument_t benchmark_arguments[
 static uint64_t next_thread_id;
 static uint64_t total_completed;
 static uint64_t total_stolen;
+static uint64_t total_process_table_submitted;
+static uint64_t total_process_table_completed;
 static bool initialized;
 
 static void clear_bytes(
@@ -188,6 +215,47 @@ static cpu_context_t *create_thread_context(
 
     frame->ss =
         GDT_KERNEL_DATA_SELECTOR;
+
+    return &frame->base;
+}
+
+static cpu_context_t *create_user_context(
+    smp_kernel_thread_t *thread,
+    uint64_t entry_point,
+    uint64_t user_stack_top,
+    uint64_t initial_argument
+)
+{
+    if (
+        thread == NULL ||
+        entry_point == 0 ||
+        user_stack_top == 0
+    )
+    {
+        return NULL;
+    }
+
+    uint8_t *kernel_stack_top =
+        thread->stack +
+        SMP_KERNEL_THREAD_STACK_SIZE;
+
+    cpu_user_context_t *frame =
+        (cpu_user_context_t *)(
+            kernel_stack_top -
+            sizeof(cpu_user_context_t)
+        );
+
+    clear_bytes(
+        frame,
+        sizeof(cpu_user_context_t)
+    );
+
+    frame->base.rdi = initial_argument;
+    frame->base.rip = entry_point;
+    frame->base.cs = GDT_USER_CODE_SELECTOR;
+    frame->base.rflags = INITIAL_RFLAGS;
+    frame->rsp = user_stack_top;
+    frame->ss = GDT_USER_DATA_SELECTOR;
 
     return &frame->base;
 }
@@ -506,6 +574,98 @@ static void wake_cpu_locked(
     }
 }
 
+static void activate_idle_locked(
+    uint32_t cpu_index,
+    smp_run_queue_t *queue
+)
+{
+    paging_activate(
+        paging_kernel_root()
+    );
+
+    if (
+        queue != NULL &&
+        queue->idle_kernel_stack_top != 0
+    )
+    {
+        gdt_set_kernel_stack(
+            queue->idle_kernel_stack_top
+        );
+    }
+
+    cpu_local_set_current_kernel_thread(
+        cpu_index,
+        0
+    );
+}
+
+static void activate_thread_locked(
+    uint32_t cpu_index,
+    smp_run_queue_t *queue,
+    smp_kernel_thread_t *thread
+)
+{
+    if (
+        queue == NULL ||
+        thread == NULL
+    )
+    {
+        activate_idle_locked(
+            cpu_index,
+            queue
+        );
+        return;
+    }
+
+    if (
+        (thread->kind == SMP_THREAD_KIND_USER ||
+         thread->kind == SMP_THREAD_KIND_PROCESS) &&
+        thread->page_table_root != 0
+    )
+    {
+        paging_activate(
+            thread->page_table_root
+        );
+
+        uint64_t stack_top =
+            thread->kernel_stack_top;
+
+        if (stack_top == 0)
+        {
+            stack_top = (uint64_t)(
+                thread->stack +
+                SMP_KERNEL_THREAD_STACK_SIZE
+            );
+        }
+
+        gdt_set_kernel_stack(stack_top);
+
+        cpu_local_set_current_process(
+            cpu_index,
+            thread->user_process_slot,
+            thread->user_pid
+        );
+
+        return;
+    }
+
+    paging_activate(
+        paging_kernel_root()
+    );
+
+    if (queue->idle_kernel_stack_top != 0)
+    {
+        gdt_set_kernel_stack(
+            queue->idle_kernel_stack_top
+        );
+    }
+
+    cpu_local_set_current_kernel_thread(
+        cpu_index,
+        thread->id
+    );
+}
+
 static cpu_context_t *select_next_locked(
     uint32_t cpu_index,
     cpu_context_t *fallback
@@ -545,9 +705,10 @@ static cpu_context_t *select_next_locked(
         queue->running_thread_id = next->id;
         queue->context_switches++;
 
-        cpu_local_set_current_kernel_thread(
+        activate_thread_locked(
             cpu_index,
-            next->id
+            queue,
+            next
         );
 
         cpu_local_note_context_switch(
@@ -563,9 +724,9 @@ static cpu_context_t *select_next_locked(
     queue->running_thread_id = 0;
     queue->idle_returns++;
 
-    cpu_local_set_current_kernel_thread(
+    activate_idle_locked(
         cpu_index,
-        0
+        queue
     );
 
     return queue->idle_context != NULL ?
@@ -596,6 +757,10 @@ static cpu_context_t *schedule_context(
     {
         return context;
     }
+
+    smp_user_completion_t completion = NULL;
+    void *completion_owner = NULL;
+    int64_t completion_status = 0;
 
     uint64_t flags =
         spinlock_lock_irqsave(
@@ -639,7 +804,15 @@ static cpu_context_t *schedule_context(
                 SMP_THREAD_RUNNING
             )
             {
-                if (timer_tick)
+                if (current->stop_requested)
+                {
+                    current->result =
+                        (uint64_t)current->stop_status;
+                    current->state =
+                        SMP_THREAD_EXITING;
+                    current->queued = false;
+                }
+                else if (timer_tick)
                 {
                     current->scheduler_ticks++;
                     current->preemptions++;
@@ -655,25 +828,29 @@ static cpu_context_t *schedule_context(
                     queue->voluntary_yields++;
                 }
 
-                current->state = SMP_THREAD_READY;
-
-                if (!queue_push_locked(
-                        cpu_index,
-                        current_slot
-                    ))
+                if (current->state == SMP_THREAD_RUNNING)
                 {
-                    current->state =
-                        SMP_THREAD_RUNNING;
+                    current->state = SMP_THREAD_READY;
 
-                    spinlock_unlock_irqrestore(
-                        &scheduler_lock,
-                        flags
-                    );
+                    if (!queue_push_locked(
+                            cpu_index,
+                            current_slot
+                        ))
+                    {
+                        current->state =
+                            SMP_THREAD_RUNNING;
 
-                    return context;
+                        spinlock_unlock_irqrestore(
+                            &scheduler_lock,
+                            flags
+                        );
+
+                        return context;
+                    }
                 }
             }
-            else if (
+
+            if (
                 current->state ==
                 SMP_THREAD_EXITING
             )
@@ -691,8 +868,34 @@ static cpu_context_t *schedule_context(
                 queue->last_result =
                     current->result;
 
-                queue->completed_jobs++;
-                total_completed++;
+                if (
+                    current->kind ==
+                    SMP_THREAD_KIND_USER
+                )
+                {
+                    queue->completed_user_processes++;
+                    completion = current->completion;
+                    completion_owner = current->owner;
+                    completion_status =
+                        (int64_t)current->result;
+                }
+                else if (
+                    current->kind ==
+                    SMP_THREAD_KIND_PROCESS
+                )
+                {
+                    queue->completed_process_table++;
+                    total_process_table_completed++;
+                    completion = current->completion;
+                    completion_owner = current->owner;
+                    completion_status =
+                        (int64_t)current->result;
+                }
+                else
+                {
+                    queue->completed_jobs++;
+                    total_completed++;
+                }
             }
         }
 
@@ -710,6 +913,15 @@ static cpu_context_t *schedule_context(
         &scheduler_lock,
         flags
     );
+
+    if (completion != NULL)
+    {
+        completion(
+            completion_owner,
+            completion_status,
+            cpu_index
+        );
+    }
 
     return next;
 }
@@ -792,7 +1004,11 @@ void smp_scheduler_init(void)
     next_thread_id = 1;
     total_completed = 0;
     total_stolen = 0;
+    total_process_table_submitted = 0;
+    total_process_table_completed = 0;
     initialized = true;
+
+    smp_user_init();
 }
 
 void smp_scheduler_cpu_online(
@@ -821,6 +1037,8 @@ void smp_scheduler_cpu_online(
     queue->count = 0;
     queue->current_thread = SMP_THREAD_NONE;
     queue->idle_context = NULL;
+    queue->idle_kernel_stack_top =
+        gdt_kernel_stack_top(cpu_index);
     queue->running_thread_id = 0;
     queue->online = true;
 
@@ -946,6 +1164,73 @@ void smp_scheduler_exit_current(
     halt_forever();
 }
 
+cpu_context_t *smp_scheduler_exit_current_user(
+    cpu_context_t *context,
+    int64_t status
+)
+{
+    if (
+        context == NULL ||
+        !initialized
+    )
+    {
+        return context;
+    }
+
+    uint32_t cpu_index =
+        smp_current_cpu_index();
+
+    if (
+        cpu_index == 0 ||
+        cpu_index >= SMP_MAX_CPUS
+    )
+    {
+        return context;
+    }
+
+    uint64_t flags =
+        spinlock_lock_irqsave(
+            &scheduler_lock
+        );
+
+    smp_run_queue_t *queue =
+        &run_queues[cpu_index];
+
+    uint32_t current_slot =
+        queue->current_thread;
+
+    if (current_slot < SMP_KERNEL_THREAD_MAX_COUNT)
+    {
+        smp_kernel_thread_t *thread =
+            &threads[current_slot];
+
+        if (
+            (thread->kind == SMP_THREAD_KIND_USER ||
+             thread->kind == SMP_THREAD_KIND_PROCESS) &&
+            thread->state ==
+                SMP_THREAD_RUNNING
+        )
+        {
+            thread->context = context;
+            thread->result =
+                (uint64_t)status;
+            thread->state =
+                SMP_THREAD_EXITING;
+            thread->queued = false;
+        }
+    }
+
+    spinlock_unlock_irqrestore(
+        &scheduler_lock,
+        flags
+    );
+
+    return schedule_context(
+        context,
+        false
+    );
+}
+
 __attribute__((noreturn))
 void smp_scheduler_ap_loop(
     uint32_t cpu_index
@@ -1050,6 +1335,8 @@ bool smp_scheduler_submit(
     thread->current_cpu = cpu_index;
     thread->last_cpu = cpu_index;
     thread->state = SMP_THREAD_READY;
+    thread->kind = SMP_THREAD_KIND_KERNEL;
+    thread->page_table_root = paging_kernel_root();
     thread->function = function;
     thread->argument = argument;
     thread->context =
@@ -1164,6 +1451,337 @@ bool smp_scheduler_submit_any(
     return true;
 }
 
+bool smp_scheduler_submit_user(
+    uint32_t cpu_index,
+    uint64_t entry_point,
+    uint64_t user_stack_top,
+    uint64_t initial_argument,
+    uint64_t page_table_root,
+    uint32_t process_slot,
+    uint64_t pid,
+    void *owner,
+    smp_user_completion_t completion,
+    uint64_t *thread_id
+)
+{
+    if (
+        !initialized ||
+        entry_point == 0 ||
+        user_stack_top == 0 ||
+        page_table_root == 0 ||
+        pid == 0 ||
+        completion == NULL
+    )
+    {
+        return false;
+    }
+
+    uint64_t flags =
+        spinlock_lock_irqsave(
+            &scheduler_lock
+        );
+
+    if (!cpu_is_worker_locked(cpu_index))
+    {
+        spinlock_unlock_irqrestore(
+            &scheduler_lock,
+            flags
+        );
+        return false;
+    }
+
+    int32_t free_slot =
+        allocate_thread_slot_locked();
+
+    if (free_slot < 0)
+    {
+        run_queues[cpu_index].rejected_jobs++;
+        spinlock_unlock_irqrestore(
+            &scheduler_lock,
+            flags
+        );
+        return false;
+    }
+
+    smp_kernel_thread_t *thread =
+        &threads[free_slot];
+
+    uint32_t preserved_slot =
+        thread->slot;
+
+    clear_bytes(
+        thread,
+        offsetof(
+            smp_kernel_thread_t,
+            stack
+        )
+    );
+
+    thread->slot = preserved_slot;
+    thread->id = next_thread_id++;
+    thread->current_cpu = cpu_index;
+    thread->last_cpu = cpu_index;
+    thread->state = SMP_THREAD_READY;
+    thread->kind = SMP_THREAD_KIND_USER;
+    thread->page_table_root = page_table_root;
+    thread->kernel_stack_top = (uint64_t)(
+        thread->stack +
+        SMP_KERNEL_THREAD_STACK_SIZE
+    );
+    thread->user_process_slot = process_slot;
+    thread->user_pid = pid;
+    thread->owner = owner;
+    thread->completion = completion;
+    thread->context = create_user_context(
+        thread,
+        entry_point,
+        user_stack_top,
+        initial_argument
+    );
+
+    if (
+        thread->context == NULL ||
+        !queue_push_locked(
+            cpu_index,
+            (uint32_t)free_slot
+        )
+    )
+    {
+        thread->state = SMP_THREAD_FREE;
+        run_queues[cpu_index].rejected_jobs++;
+        spinlock_unlock_irqrestore(
+            &scheduler_lock,
+            flags
+        );
+        return false;
+    }
+
+    run_queues[cpu_index]
+        .submitted_user_processes++;
+
+    if (thread_id != NULL)
+    {
+        *thread_id = thread->id;
+    }
+
+    wake_cpu_locked(cpu_index);
+
+    spinlock_unlock_irqrestore(
+        &scheduler_lock,
+        flags
+    );
+
+    return true;
+}
+
+bool smp_scheduler_submit_process_any(
+    cpu_context_t *context,
+    uint64_t page_table_root,
+    uint64_t kernel_stack_top,
+    uint32_t process_slot,
+    uint64_t pid,
+    void *owner,
+    smp_user_completion_t completion,
+    uint32_t *cpu_index,
+    uint64_t *thread_id
+)
+{
+    if (
+        !initialized ||
+        context == NULL ||
+        page_table_root == 0 ||
+        kernel_stack_top == 0 ||
+        pid == 0 ||
+        owner == NULL ||
+        completion == NULL
+    )
+    {
+        return false;
+    }
+
+    uint64_t flags =
+        spinlock_lock_irqsave(
+            &scheduler_lock
+        );
+
+    uint32_t selected = 0;
+    uint32_t selected_load = UINT32_MAX;
+
+    for (
+        uint32_t index = 1;
+        index < smp_cpu_count();
+        index++
+    )
+    {
+        if (!cpu_is_worker_locked(index))
+        {
+            continue;
+        }
+
+        uint32_t load =
+            queue_load_locked(index);
+
+        if (load < selected_load)
+        {
+            selected = index;
+            selected_load = load;
+        }
+    }
+
+    if (selected == 0)
+    {
+        spinlock_unlock_irqrestore(
+            &scheduler_lock,
+            flags
+        );
+        return false;
+    }
+
+    int32_t free_slot =
+        allocate_thread_slot_locked();
+
+    if (free_slot < 0)
+    {
+        run_queues[selected].rejected_jobs++;
+        spinlock_unlock_irqrestore(
+            &scheduler_lock,
+            flags
+        );
+        return false;
+    }
+
+    smp_kernel_thread_t *thread =
+        &threads[free_slot];
+
+    uint32_t preserved_slot =
+        thread->slot;
+
+    clear_bytes(
+        thread,
+        offsetof(
+            smp_kernel_thread_t,
+            stack
+        )
+    );
+
+    thread->slot = preserved_slot;
+    thread->id = next_thread_id++;
+    thread->current_cpu = selected;
+    thread->last_cpu = selected;
+    thread->state = SMP_THREAD_READY;
+    thread->kind = SMP_THREAD_KIND_PROCESS;
+    thread->context = context;
+    thread->page_table_root = page_table_root;
+    thread->kernel_stack_top = kernel_stack_top;
+    thread->user_process_slot = process_slot;
+    thread->user_pid = pid;
+    thread->owner = owner;
+    thread->completion = completion;
+
+    if (!queue_push_locked(
+            selected,
+            (uint32_t)free_slot
+        ))
+    {
+        thread->state = SMP_THREAD_FREE;
+        run_queues[selected].rejected_jobs++;
+        spinlock_unlock_irqrestore(
+            &scheduler_lock,
+            flags
+        );
+        return false;
+    }
+
+    run_queues[selected]
+        .submitted_process_table++;
+    total_process_table_submitted++;
+
+    if (cpu_index != NULL)
+    {
+        *cpu_index = selected;
+    }
+
+    if (thread_id != NULL)
+    {
+        *thread_id = thread->id;
+    }
+
+    wake_cpu_locked(selected);
+
+    spinlock_unlock_irqrestore(
+        &scheduler_lock,
+        flags
+    );
+
+    return true;
+}
+
+bool smp_scheduler_request_process_stop(
+    uint32_t process_slot,
+    uint64_t pid,
+    int64_t status
+)
+{
+    if (
+        !initialized ||
+        pid == 0
+    )
+    {
+        return false;
+    }
+
+    uint64_t flags =
+        spinlock_lock_irqsave(
+            &scheduler_lock
+        );
+
+    bool found = false;
+
+    for (
+        uint32_t slot = 0;
+        slot < SMP_KERNEL_THREAD_MAX_COUNT;
+        slot++
+    )
+    {
+        smp_kernel_thread_t *thread =
+            &threads[slot];
+
+        if (
+            thread->kind != SMP_THREAD_KIND_PROCESS ||
+            thread->user_process_slot != process_slot ||
+            thread->user_pid != pid ||
+            (thread->state != SMP_THREAD_READY &&
+             thread->state != SMP_THREAD_RUNNING)
+        )
+        {
+            continue;
+        }
+
+        thread->stop_requested = true;
+        thread->stop_status = status;
+        found = true;
+
+        if (
+            thread->current_cpu > 0 &&
+            thread->current_cpu < SMP_MAX_CPUS
+        )
+        {
+            wake_cpu_locked(
+                thread->current_cpu
+            );
+        }
+
+        break;
+    }
+
+    spinlock_unlock_irqrestore(
+        &scheduler_lock,
+        flags
+    );
+
+    return found;
+}
+
 uint32_t smp_scheduler_start_benchmark(
     uint64_t iterations
 )
@@ -1179,6 +1797,8 @@ uint32_t smp_scheduler_start_benchmark(
         iterations =
             MAX_BENCHMARK_ITERATIONS;
     }
+
+    (void)paging_run_shootdown_self_test();
 
     uint32_t active_cpus = 0;
 
@@ -1247,6 +1867,10 @@ uint32_t smp_scheduler_start_benchmark(
             active_cpus++;
         }
     }
+
+    (void)smp_user_start_benchmark(
+        iterations
+    );
 
     return active_cpus;
 }
@@ -1386,6 +2010,35 @@ bool smp_scheduler_preemption_enabled(
     return enabled;
 }
 
+uint64_t smp_scheduler_cpu_sequence(
+    uint32_t cpu_index
+)
+{
+    if (
+        !initialized ||
+        cpu_index >= SMP_MAX_CPUS
+    )
+    {
+        return 0;
+    }
+
+    uint64_t flags =
+        spinlock_lock_irqsave(
+            &scheduler_lock
+        );
+
+    uint64_t sequence =
+        run_queues[cpu_index]
+            .schedule_sequence;
+
+    spinlock_unlock_irqrestore(
+        &scheduler_lock,
+        flags
+    );
+
+    return sequence;
+}
+
 const char *smp_job_state_name(
     smp_job_state_t state
 )
@@ -1469,7 +2122,7 @@ void smp_scheduler_print_status(void)
             &run_queues[cpu_index];
 
         kprintf(
-            "CPU %u APIC=%u ready=%u current=%llu preempt=%s submitted=%llu completed=%llu switches=%llu timer=%llu yields=%llu steal-in=%llu steal-out=%llu rejected=%llu wake-fail=%llu last=%llu result=0x%llX\n",
+            "CPU %u APIC=%u ready=%u current=%llu preempt=%s ksubmit=%llu usubmit=%llu psubmit=%llu kdone=%llu udone=%llu pdone=%llu switches=%llu timer=%llu yields=%llu steal-in=%llu steal-out=%llu rejected=%llu wake-fail=%llu last=%llu result=0x%llX\n",
             (unsigned int)cpu_index,
             (unsigned int)cpu->apic_id,
             (unsigned int)queue->count,
@@ -1480,7 +2133,15 @@ void smp_scheduler_print_status(void)
             (unsigned long long)
                 queue->submitted_jobs,
             (unsigned long long)
+                queue->submitted_user_processes,
+            (unsigned long long)
+                queue->submitted_process_table,
+            (unsigned long long)
                 queue->completed_jobs,
+            (unsigned long long)
+                queue->completed_user_processes,
+            (unsigned long long)
+                queue->completed_process_table,
             (unsigned long long)
                 queue->context_switches,
             (unsigned long long)
@@ -1502,8 +2163,23 @@ void smp_scheduler_print_status(void)
         );
     }
 
+    kprintf(
+        "SMP process table: submitted=%llu completed=%llu active=%llu\n",
+        (unsigned long long)
+            total_process_table_submitted,
+        (unsigned long long)
+            total_process_table_completed,
+        (unsigned long long)(
+            total_process_table_submitted -
+            total_process_table_completed
+        )
+    );
+
     spinlock_unlock_irqrestore(
         &scheduler_lock,
         flags
     );
+
+    smp_user_print_status();
+    paging_print_status();
 }

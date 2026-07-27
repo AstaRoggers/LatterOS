@@ -1,5 +1,6 @@
 #include "process.h"
 
+#include "cpu_local.h"
 #include "executable.h"
 #include "gdt.h"
 #include "hhdm.h"
@@ -9,6 +10,9 @@
 #include "paging.h"
 #include "physical_memory.h"
 #include "security.h"
+#include "smp.h"
+#include "smp_scheduler.h"
+#include "spinlock.h"
 #include "terminal.h"
 #include "vfs.h"
 
@@ -34,72 +38,22 @@
 extern void process_task_bootstrap(void);
 
 static process_t processes[PROCESS_MAX_COUNT];
-static uint32_t current_index;
-static uint64_t next_pid;
-static uint32_t demo_thread_number;
-static bool initialized;
-
 static volatile uint64_t demo_counters[
     PROCESS_MAX_COUNT
 ];
 
-static uint64_t interrupt_save_and_disable(void)
-{
-    uint64_t flags;
-
-    __asm__ volatile(
-        "pushfq\n"
-        "popq %0\n"
-        "cli"
-        : "=r"(flags)
-        :
-        : "memory"
-    );
-
-    return flags;
-}
-
-static void interrupt_restore(uint64_t flags)
-{
-    if (flags & (1ULL << 9))
-    {
-        __asm__ volatile(
-            "sti"
-            :
-            :
-            : "memory"
-        );
-    }
-}
-
-static uint64_t kernel_guard_for_slot(
-    uint32_t slot
-)
-{
-    return
-        KERNEL_STACK_REGION_BASE +
-        (uint64_t)slot *
-            KERNEL_STACK_STRIDE +
-        KERNEL_STACK_GUARD_OFFSET;
-}
-
-static uint64_t kernel_stack_for_slot(
-    uint32_t slot
-)
-{
-    return
-        KERNEL_STACK_REGION_BASE +
-        (uint64_t)slot *
-            KERNEL_STACK_STRIDE +
-        KERNEL_STACK_PAGE_OFFSET;
-}
+static spinlock_t process_lock;
+static uint32_t bsp_current_index;
+static uint64_t next_pid;
+static uint32_t demo_thread_number;
+static bool initialized;
 
 static void clear_bytes(
     void *pointer,
     size_t count
 )
 {
-    uint8_t *bytes = pointer;
+    uint8_t *bytes = (uint8_t *)pointer;
 
     for (
         size_t index = 0;
@@ -115,11 +69,14 @@ static void clear_process(process_t *process)
 {
     clear_bytes(
         process,
-        sizeof(process_t)
+        sizeof(*process)
     );
 
     process->state = PROCESS_UNUSED;
     process->mode = PROCESS_KERNEL;
+    process->assigned_cpu = PROCESS_CPU_NONE;
+    process->running_cpu = PROCESS_CPU_NONE;
+    process->retired_cpu = PROCESS_CPU_NONE;
 }
 
 static void copy_name(
@@ -163,16 +120,140 @@ static const char *path_name(
     return name;
 }
 
-static void destroy_process_slot(
+static uint64_t kernel_guard_for_slot(
     uint32_t slot
 )
 {
+    return
+        KERNEL_STACK_REGION_BASE +
+        (uint64_t)slot *
+            KERNEL_STACK_STRIDE +
+        KERNEL_STACK_GUARD_OFFSET;
+}
+
+static uint64_t kernel_stack_for_slot(
+    uint32_t slot
+)
+{
+    return
+        KERNEL_STACK_REGION_BASE +
+        (uint64_t)slot *
+            KERNEL_STACK_STRIDE +
+        KERNEL_STACK_PAGE_OFFSET;
+}
+
+static uint32_t current_cpu_index(void)
+{
+    if (!initialized)
+    {
+        return 0;
+    }
+
+    uint32_t cpu_index =
+        smp_current_cpu_index();
+
+    if (cpu_index >= CPU_LOCAL_MAX_CPUS)
+    {
+        return 0;
+    }
+
+    return cpu_index;
+}
+
+static uint32_t current_slot_unlocked(void)
+{
+    uint32_t cpu_index = current_cpu_index();
+
+    if (cpu_index == 0)
+    {
+        return bsp_current_index;
+    }
+
+    cpu_local_t *local =
+        cpu_local_current();
+
+    if (
+        local == NULL ||
+        local->current_process_slot >=
+            PROCESS_MAX_COUNT
+    )
+    {
+        return 0;
+    }
+
+    uint32_t slot =
+        local->current_process_slot;
+
+    if (
+        processes[slot].state ==
+            PROCESS_UNUSED ||
+        processes[slot].pid !=
+            local->current_pid
+    )
+    {
+        return 0;
+    }
+
+    return slot;
+}
+
+static bool process_can_reap_locked(
+    uint32_t slot,
+    uint32_t excluded_slot
+)
+{
+    if (
+        slot == 0 ||
+        slot == excluded_slot ||
+        slot >= PROCESS_MAX_COUNT
+    )
+    {
+        return false;
+    }
+
     process_t *process =
         &processes[slot];
 
     if (
-        process->mode == PROCESS_USER
+        process->state != PROCESS_TERMINATED ||
+        process->scheduler_enqueued ||
+        process->running_cpu != PROCESS_CPU_NONE
     )
+    {
+        return false;
+    }
+
+    if (
+        !process->smp_managed ||
+        process->retired_cpu == PROCESS_CPU_NONE
+    )
+    {
+        return true;
+    }
+
+    return (
+        smp_scheduler_cpu_sequence(
+            process->retired_cpu
+        ) > process->retired_sequence
+    );
+}
+
+static void destroy_process_slot_locked(
+    uint32_t slot
+)
+{
+    if (
+        slot == 0 ||
+        slot >= PROCESS_MAX_COUNT
+    )
+    {
+        return;
+    }
+
+    process_t *process =
+        &processes[slot];
+
+    if (process->mode == PROCESS_USER)
     {
         if (
             process->page_table_root != 0 &&
@@ -218,7 +299,7 @@ static void destroy_process_slot(
     clear_process(process);
 }
 
-static void reap_terminated(
+static void reap_terminated_locked(
     uint32_t excluded_slot
 )
 {
@@ -228,33 +309,34 @@ static void reap_terminated(
         slot++
     )
     {
-        if (
-            slot != excluded_slot &&
-            processes[slot].state ==
-                PROCESS_TERMINATED
-        )
+        if (process_can_reap_locked(
+                slot,
+                excluded_slot
+            ))
         {
-            destroy_process_slot(slot);
+            destroy_process_slot_locked(slot);
         }
     }
 }
 
-static int32_t find_free_slot(void)
+static int32_t find_free_slot_locked(void)
 {
-    reap_terminated(current_index);
+    reap_terminated_locked(
+        current_slot_unlocked()
+    );
 
     for (
-        uint32_t index = 1;
-        index < PROCESS_MAX_COUNT;
-        index++
+        uint32_t slot = 1;
+        slot < PROCESS_MAX_COUNT;
+        slot++
     )
     {
         if (
-            processes[index].state ==
-            PROCESS_UNUSED
+            processes[slot].state ==
+                PROCESS_UNUSED
         )
         {
-            return (int32_t)index;
+            return (int32_t)slot;
         }
     }
 
@@ -267,21 +349,9 @@ static cpu_context_t *create_kernel_context(
     void *argument
 )
 {
-    uint8_t *stack_base =
-        (uint8_t *)stack_virtual;
-
     uint8_t *stack_top =
-        stack_base + PAGE_SIZE;
+        (uint8_t *)stack_virtual + PAGE_SIZE;
 
-    /*
-     * Reserve a complete five-word IRETQ tail even for a ring-0
-     * thread. A same-privilege IRETQ consumes only RIP, CS, and
-     * RFLAGS, leaving RSP sixteen bytes below the page boundary.
-     *
-     * Keeping the two extra words inside the mapped stack page
-     * prevents IRETQ from touching the unmapped page immediately
-     * above a newly created guarded stack.
-     */
     cpu_user_context_t *frame =
         (cpu_user_context_t *)(
             stack_top -
@@ -290,29 +360,18 @@ static cpu_context_t *create_kernel_context(
 
     clear_bytes(
         frame,
-        sizeof(cpu_user_context_t)
+        sizeof(*frame)
     );
 
-    frame->base.r12 =
-        (uint64_t)entry;
-
-    frame->base.r13 =
-        (uint64_t)argument;
-
+    frame->base.r12 = (uint64_t)entry;
+    frame->base.r13 = (uint64_t)argument;
     frame->base.rip =
         (uint64_t)process_task_bootstrap;
-
     frame->base.cs =
         GDT_KERNEL_CODE_SELECTOR;
-
-    frame->base.rflags =
-        INITIAL_RFLAGS;
-
-    frame->rsp =
-        (uint64_t)stack_top;
-
-    frame->ss =
-        GDT_KERNEL_DATA_SELECTOR;
+    frame->base.rflags = INITIAL_RFLAGS;
+    frame->rsp = (uint64_t)stack_top;
+    frame->ss = GDT_KERNEL_DATA_SELECTOR;
 
     return &frame->base;
 }
@@ -323,11 +382,9 @@ static cpu_context_t *create_user_context(
     uint64_t stack_virtual
 )
 {
-    uint8_t *kernel_stack_base =
-        (uint8_t *)kernel_stack_virtual;
-
     uint8_t *kernel_stack_top =
-        kernel_stack_base + PAGE_SIZE;
+        (uint8_t *)kernel_stack_virtual +
+        PAGE_SIZE;
 
     cpu_user_context_t *context =
         (cpu_user_context_t *)(
@@ -337,67 +394,20 @@ static cpu_context_t *create_user_context(
 
     clear_bytes(
         context,
-        sizeof(cpu_user_context_t)
+        sizeof(*context)
     );
 
-    context->base.rip =
-        code_virtual;
-
-    context->base.cs =
-        GDT_USER_CODE_SELECTOR;
-
-    context->base.rflags =
-        INITIAL_RFLAGS;
-
+    context->base.rip = code_virtual;
+    context->base.cs = GDT_USER_CODE_SELECTOR;
+    context->base.rflags = INITIAL_RFLAGS;
     context->rsp =
         stack_virtual + PAGE_SIZE - 16;
-
-    context->ss =
-        GDT_USER_DATA_SELECTOR;
+    context->ss = GDT_USER_DATA_SELECTOR;
 
     return &context->base;
 }
 
-static uint32_t find_next_ready(void)
-{
-    for (
-        uint32_t offset = 1;
-        offset <= PROCESS_MAX_COUNT;
-        offset++
-    )
-    {
-        uint32_t index =
-            (current_index + offset) %
-            PROCESS_MAX_COUNT;
-
-        if (
-            processes[index].state ==
-            PROCESS_READY
-        )
-        {
-            return index;
-        }
-    }
-
-    return current_index;
-}
-
-static void select_kernel_stack(
-    const process_t *process
-)
-{
-    if (
-        process != NULL &&
-        process->kernel_stack_top != 0
-    )
-    {
-        gdt_set_kernel_stack(
-            process->kernel_stack_top
-        );
-    }
-}
-
-static void select_address_space(
+static void select_process(
     const process_t *process
 )
 {
@@ -412,9 +422,51 @@ static void select_address_space(
     }
 
     paging_activate(root);
+
+    if (
+        process != NULL &&
+        process->kernel_stack_top != 0
+    )
+    {
+        gdt_set_kernel_stack(
+            process->kernel_stack_top
+        );
+    }
 }
 
-static cpu_context_t *schedule(
+static uint32_t find_next_bsp_ready_locked(void)
+{
+    for (
+        uint32_t offset = 1;
+        offset <= PROCESS_MAX_COUNT;
+        offset++
+    )
+    {
+        uint32_t slot =
+            (bsp_current_index + offset) %
+            PROCESS_MAX_COUNT;
+
+        process_t *process =
+            &processes[slot];
+
+        if (
+            process->state == PROCESS_READY &&
+            !process->scheduler_enqueued &&
+            (
+                process->assigned_cpu == 0 ||
+                process->assigned_cpu ==
+                    PROCESS_CPU_NONE
+            )
+        )
+        {
+            return slot;
+        }
+    }
+
+    return bsp_current_index;
+}
+
+static cpu_context_t *schedule_bsp(
     cpu_context_t *context,
     bool charge_tick
 )
@@ -427,10 +479,14 @@ static cpu_context_t *schedule(
         return context;
     }
 
-    reap_terminated(current_index);
+    spinlock_lock(&process_lock);
+
+    reap_terminated_locked(
+        bsp_current_index
+    );
 
     process_t *current =
-        &processes[current_index];
+        &processes[bsp_current_index];
 
     current->context = context;
 
@@ -439,20 +495,16 @@ static cpu_context_t *schedule(
         current->cpu_ticks++;
     }
 
-    if (
-        current->state ==
-        PROCESS_RUNNING
-    )
+    if (current->state == PROCESS_RUNNING)
     {
-        current->state =
-            PROCESS_READY;
+        current->state = PROCESS_READY;
     }
 
-    uint32_t next_index =
-        find_next_ready();
+    uint32_t next_slot =
+        find_next_bsp_ready_locked();
 
     process_t *next =
-        &processes[next_index];
+        &processes[next_slot];
 
     if (
         next->state != PROCESS_READY ||
@@ -461,41 +513,193 @@ static cpu_context_t *schedule(
     {
         if (
             current->state !=
-            PROCESS_TERMINATED
+                PROCESS_TERMINATED
         )
         {
-            current->state =
-                PROCESS_RUNNING;
-
-            select_address_space(current);
-            select_kernel_stack(current);
+            current->state = PROCESS_RUNNING;
+            current->assigned_cpu = 0;
+            current->running_cpu = 0;
+            select_process(current);
+            spinlock_unlock(&process_lock);
             return context;
         }
 
-        /* The kernel process is always expected to remain runnable. */
-        process_t *kernel =
-            &processes[0];
+        process_t *kernel = &processes[0];
+        kernel->state = PROCESS_RUNNING;
+        kernel->assigned_cpu = 0;
+        kernel->running_cpu = 0;
+        bsp_current_index = 0;
+        select_process(kernel);
 
-        kernel->state =
-            PROCESS_RUNNING;
-
-        current_index = 0;
-        select_address_space(kernel);
-        select_kernel_stack(kernel);
-
-        return kernel->context != NULL ?
+        cpu_context_t *result =
+            kernel->context != NULL ?
             kernel->context :
             context;
+
+        spinlock_unlock(&process_lock);
+        return result;
     }
 
+    current->running_cpu = PROCESS_CPU_NONE;
+
     next->state = PROCESS_RUNNING;
+    next->assigned_cpu = 0;
+    next->running_cpu = 0;
     next->switches++;
-    current_index = next_index;
+    bsp_current_index = next_slot;
 
-    select_address_space(next);
-    select_kernel_stack(next);
+    select_process(next);
 
-    return next->context;
+    cpu_context_t *result = next->context;
+    spinlock_unlock(&process_lock);
+    return result;
+}
+
+static void process_smp_completion(
+    void *owner,
+    int64_t status,
+    uint32_t cpu_index
+)
+{
+    process_t *process =
+        (process_t *)owner;
+
+    if (process == NULL)
+    {
+        return;
+    }
+
+    uint64_t retired_sequence =
+        smp_scheduler_cpu_sequence(
+            cpu_index
+        );
+
+    uint64_t flags =
+        spinlock_lock_irqsave(
+            &process_lock
+        );
+
+    if (
+        process->state != PROCESS_UNUSED
+    )
+    {
+        process->exit_status = status;
+        process->state = PROCESS_TERMINATED;
+        process->scheduler_enqueued = false;
+        process->running_cpu = PROCESS_CPU_NONE;
+        process->assigned_cpu = cpu_index;
+        process->retired_cpu = cpu_index;
+        process->retired_sequence =
+            retired_sequence;
+        process->switches++;
+    }
+
+    spinlock_unlock_irqrestore(
+        &process_lock,
+        flags
+    );
+}
+
+static void dispatch_user_process(
+    uint32_t slot
+)
+{
+    if (slot >= PROCESS_MAX_COUNT)
+    {
+        return;
+    }
+
+    process_t *process =
+        &processes[slot];
+
+    uint64_t prepare_flags =
+        spinlock_lock_irqsave(
+            &process_lock
+        );
+
+    if (
+        process->state == PROCESS_UNUSED ||
+        process->mode != PROCESS_USER ||
+        process->context == NULL
+    )
+    {
+        spinlock_unlock_irqrestore(
+            &process_lock,
+            prepare_flags
+        );
+        return;
+    }
+
+    process->smp_managed = true;
+    process->scheduler_enqueued = true;
+    process->state = PROCESS_RUNNING;
+    process->assigned_cpu = PROCESS_CPU_NONE;
+    process->running_cpu = PROCESS_CPU_NONE;
+    process->retired_cpu = PROCESS_CPU_NONE;
+    process->retired_sequence = 0;
+
+    spinlock_unlock_irqrestore(
+        &process_lock,
+        prepare_flags
+    );
+
+    uint32_t cpu_index = PROCESS_CPU_NONE;
+    uint64_t thread_id = 0;
+
+    bool submitted =
+        smp_scheduler_submit_process_any(
+            process->context,
+            process->page_table_root,
+            process->kernel_stack_top,
+            slot,
+            process->pid,
+            process,
+            process_smp_completion,
+            &cpu_index,
+            &thread_id
+        );
+
+    uint64_t flags =
+        spinlock_lock_irqsave(
+            &process_lock
+        );
+
+    if (
+        process->state == PROCESS_UNUSED ||
+        process->pid == 0
+    )
+    {
+        spinlock_unlock_irqrestore(
+            &process_lock,
+            flags
+        );
+        return;
+    }
+
+    if (submitted)
+    {
+        if (process->scheduler_enqueued)
+        {
+            process->assigned_cpu = cpu_index;
+            process->running_cpu = cpu_index;
+            process->scheduler_thread_id =
+                thread_id;
+        }
+    }
+    else
+    {
+        process->smp_managed = false;
+        process->scheduler_enqueued = false;
+        process->state = PROCESS_READY;
+        process->assigned_cpu = 0;
+        process->running_cpu = PROCESS_CPU_NONE;
+        process->scheduler_thread_id = 0;
+    }
+
+    spinlock_unlock_irqrestore(
+        &process_lock,
+        flags
+    );
 }
 
 static void demo_thread(void *argument)
@@ -506,7 +710,6 @@ static void demo_thread(void *argument)
     for (;;)
     {
         (*counter)++;
-
         __asm__ volatile(
             "pause"
             :
@@ -533,13 +736,8 @@ static void uint64_to_string(
 
     while (value > 0)
     {
-        temporary[length] =
-            (char)(
-                '0' +
-                value % 10
-            );
-
-        length++;
+        temporary[length++] =
+            (char)('0' + value % 10);
         value /= 10;
     }
 
@@ -550,9 +748,7 @@ static void uint64_to_string(
     )
     {
         buffer[index] =
-            temporary[
-                length - index - 1
-            ];
+            temporary[length - index - 1];
     }
 
     buffer[length] = '\0';
@@ -590,40 +786,35 @@ static const char *mode_name(
 void process_init(void)
 {
     irq_disable();
+    spinlock_init(&process_lock);
 
     for (
-        uint32_t index = 0;
-        index < PROCESS_MAX_COUNT;
-        index++
+        uint32_t slot = 0;
+        slot < PROCESS_MAX_COUNT;
+        slot++
     )
     {
-        clear_process(
-            &processes[index]
-        );
-
-        demo_counters[index] = 0;
+        clear_process(&processes[slot]);
+        demo_counters[slot] = 0;
     }
 
-    process_t *kernel =
-        &processes[0];
+    process_t *kernel = &processes[0];
 
     kernel->pid = 0;
     kernel->parent_pid = 0;
     kernel->page_table_root =
         paging_kernel_root();
-    copy_name(
-        kernel->name,
-        "kernel"
-    );
-
+    copy_name(kernel->name, "kernel");
     kernel->state = PROCESS_RUNNING;
     kernel->mode = PROCESS_KERNEL;
     kernel->uid = SECURITY_UID_ROOT;
     kernel->gid = SECURITY_GID_ROOT;
     kernel->capabilities = SECURITY_CAP_ALL;
     kernel->switches = 1;
+    kernel->assigned_cpu = 0;
+    kernel->running_cpu = 0;
 
-    current_index = 0;
+    bsp_current_index = 0;
     next_pid = 1;
     demo_thread_number = 0;
     initialized = true;
@@ -643,24 +834,31 @@ bool process_create_kernel_thread(
         return false;
     }
 
-    uint64_t interrupt_flags =
-        interrupt_save_and_disable();
+    uint64_t flags =
+        spinlock_lock_irqsave(
+            &process_lock
+        );
 
-    bool created = false;
-    void *kernel_stack_page = NULL;
-
-    int32_t slot = find_free_slot();
+    int32_t slot = find_free_slot_locked();
 
     if (slot < 0)
     {
-        goto finish;
+        spinlock_unlock_irqrestore(
+            &process_lock,
+            flags
+        );
+        return false;
     }
 
-    kernel_stack_page = alloc_page();
+    void *kernel_stack_page = alloc_page();
 
     if (kernel_stack_page == NULL)
     {
-        goto finish;
+        spinlock_unlock_irqrestore(
+            &process_lock,
+            flags
+        );
+        return false;
     }
 
     uint64_t kernel_guard =
@@ -673,27 +871,34 @@ bool process_create_kernel_thread(
             (uint32_t)slot
         );
 
-    (void)paging_unmap_page(kernel_guard);
-    (void)paging_unmap_page(kernel_stack_virtual);
+    (void)paging_unmap_page_in(
+        paging_kernel_root(),
+        kernel_guard
+    );
 
-    if (
-        !paging_map_kernel_page(
+    (void)paging_unmap_page_in(
+        paging_kernel_root(),
+        kernel_stack_virtual
+    );
+
+    if (!paging_map_kernel_page(
             kernel_stack_virtual,
             (uint64_t)kernel_stack_page,
             true
-        )
-    )
+        ))
     {
         free_page(kernel_stack_page);
-        kernel_stack_page = NULL;
-        goto finish;
+        spinlock_unlock_irqrestore(
+            &process_lock,
+            flags
+        );
+        return false;
     }
 
     process_t *process =
         &processes[slot];
 
     clear_process(process);
-
     process->pid = next_pid++;
     process->parent_pid = 0;
     process->page_table_root =
@@ -706,28 +911,26 @@ bool process_create_kernel_thread(
     process->capabilities = SECURITY_CAP_ALL;
     process->kernel_stack_page =
         kernel_stack_page;
-
     process->kernel_stack_virtual =
         kernel_stack_virtual;
-
     process->kernel_stack_guard =
         kernel_guard;
-
     process->kernel_stack_top =
         kernel_stack_virtual + PAGE_SIZE;
-
     process->context =
         create_kernel_context(
             kernel_stack_virtual,
             entry,
             argument
         );
+    process->assigned_cpu = 0;
 
-    created = true;
+    spinlock_unlock_irqrestore(
+        &process_lock,
+        flags
+    );
 
-finish:
-    interrupt_restore(interrupt_flags);
-    return created;
+    return true;
 }
 
 bool process_spawn_demo_thread(void)
@@ -745,24 +948,16 @@ bool process_spawn_demo_thread(void)
 
     uint32_t number =
         demo_thread_number + 1;
-
     uint32_t position = 7;
 
     if (number >= 10)
     {
         name[position++] =
-            (char)(
-                '0' +
-                number / 10
-            );
+            (char)('0' + number / 10);
     }
 
     name[position++] =
-        (char)(
-            '0' +
-            number % 10
-        );
-
+        (char)('0' + number % 10);
     name[position] = '\0';
 
     bool created =
@@ -808,31 +1003,51 @@ uint64_t process_create_user_program(
         return 0;
     }
 
-    uint64_t interrupt_flags =
-        interrupt_save_and_disable();
+    uint64_t flags =
+        spinlock_lock_irqsave(
+            &process_lock
+        );
 
-    uint64_t pid = 0;
-    void *kernel_stack_page = NULL;
-    void *user_code_page = NULL;
-    void *user_stack_page = NULL;
-    uint64_t user_root = 0;
-    uint64_t kernel_stack_virtual = 0;
-    uint64_t code_virtual = 0;
-    uint64_t stack_virtual = 0;
-    bool kernel_stack_mapped = false;
-    size_t image_size = 0;
-    uint32_t entry_offset = 0;
-
-    int32_t slot = find_free_slot();
+    int32_t slot = find_free_slot_locked();
 
     if (slot < 0)
     {
-        goto finish;
+        spinlock_unlock_irqrestore(
+            &process_lock,
+            flags
+        );
+        return 0;
     }
 
-    kernel_stack_page = alloc_page();
-    user_code_page = alloc_page();
-    user_stack_page = alloc_page();
+    const process_t *parent =
+        process_current();
+
+    uint64_t parent_pid =
+        parent != NULL ? parent->pid : 0;
+    uint32_t uid;
+    uint32_t gid;
+    uint64_t capabilities;
+
+    if (
+        parent != NULL &&
+        parent->mode == PROCESS_USER
+    )
+    {
+        uid = parent->uid;
+        gid = parent->gid;
+        capabilities = parent->capabilities;
+    }
+    else
+    {
+        uid = security_session_uid();
+        gid = security_session_gid();
+        capabilities =
+            security_session_capabilities();
+    }
+
+    void *kernel_stack_page = alloc_page();
+    void *user_code_page = alloc_page();
+    void *user_stack_page = alloc_page();
 
     if (
         kernel_stack_page == NULL ||
@@ -840,7 +1055,24 @@ uint64_t process_create_user_program(
         user_stack_page == NULL
     )
     {
-        goto finish;
+        if (kernel_stack_page != NULL)
+        {
+            free_page(kernel_stack_page);
+        }
+        if (user_code_page != NULL)
+        {
+            free_page(user_code_page);
+        }
+        if (user_stack_page != NULL)
+        {
+            free_page(user_stack_page);
+        }
+
+        spinlock_unlock_irqrestore(
+            &process_lock,
+            flags
+        );
+        return 0;
     }
 
     uint64_t region_base =
@@ -848,15 +1080,11 @@ uint64_t process_create_user_program(
         (uint64_t)slot *
             USER_REGION_STRIDE;
 
-    code_virtual =
-        region_base +
-        USER_CODE_OFFSET;
-
+    uint64_t code_virtual =
+        region_base + USER_CODE_OFFSET;
     uint64_t stack_guard =
-        region_base +
-        USER_STACK_OFFSET;
-
-    stack_virtual =
+        region_base + USER_STACK_OFFSET;
+    uint64_t stack_virtual =
         stack_guard + PAGE_SIZE;
 
     clear_bytes(
@@ -877,8 +1105,7 @@ uint64_t process_create_user_program(
         kernel_guard_for_slot(
             (uint32_t)slot
         );
-
-    kernel_stack_virtual =
+    uint64_t kernel_stack_virtual =
         kernel_stack_for_slot(
             (uint32_t)slot
         );
@@ -893,21 +1120,21 @@ uint64_t process_create_user_program(
         kernel_stack_virtual
     );
 
-    if (
-        !paging_map_kernel_page(
+    bool kernel_stack_mapped =
+        paging_map_kernel_page(
             kernel_stack_virtual,
             (uint64_t)kernel_stack_page,
             true
-        )
-    )
+        );
+
+    size_t image_size = 0;
+    uint32_t entry_offset = 0;
+    uint64_t user_root = 0;
+    bool loaded = false;
+
+    if (kernel_stack_mapped)
     {
-        goto finish;
-    }
-
-    kernel_stack_mapped = true;
-
-    if (
-        !executable_load(
+        loaded = executable_load(
             file,
             physical_to_virtual(
                 (uint64_t)user_code_page
@@ -915,125 +1142,37 @@ uint64_t process_create_user_program(
             PAGE_SIZE,
             &image_size,
             &entry_offset
-        )
-    )
-    {
-        goto finish;
-    }
-
-    user_root =
-        paging_create_user_space();
-
-    if (user_root == 0)
-    {
-        goto finish;
-    }
-
-    if (
-        !paging_map_user_page_in(
-            user_root,
-            code_virtual,
-            (uint64_t)user_code_page,
-            false,
-            true
-        ) ||
-        !paging_map_user_page_in(
-            user_root,
-            stack_virtual,
-            (uint64_t)user_stack_page,
-            true,
-            false
-        )
-    )
-    {
-        goto finish;
-    }
-
-    process_t *process =
-        &processes[slot];
-
-    clear_process(process);
-
-    process->pid = next_pid++;
-
-    const process_t *parent =
-        process_current();
-
-    process->parent_pid =
-        parent != NULL ?
-        parent->pid :
-        0;
-
-    copy_name(
-        process->name,
-        path_name(path)
-    );
-
-    process->state = PROCESS_READY;
-    process->mode = PROCESS_USER;
-
-    if (
-        parent != NULL &&
-        parent->mode == PROCESS_USER
-    )
-    {
-        process->uid = parent->uid;
-        process->gid = parent->gid;
-        process->capabilities =
-            parent->capabilities;
-    }
-    else
-    {
-        process->uid =
-            security_session_uid();
-        process->gid =
-            security_session_gid();
-        process->capabilities =
-            security_session_capabilities();
-    }
-
-    process->page_table_root = user_root;
-    process->kernel_stack_page =
-        kernel_stack_page;
-
-    process->kernel_stack_virtual =
-        kernel_stack_virtual;
-
-    process->kernel_stack_guard =
-        kernel_guard;
-
-    process->kernel_stack_top =
-        kernel_stack_virtual + PAGE_SIZE;
-
-    process->user_code_page =
-        user_code_page;
-
-    process->user_stack_page =
-        user_stack_page;
-
-    process->user_code_virtual =
-        code_virtual;
-
-    process->user_stack_virtual =
-        stack_virtual;
-
-    process->user_stack_guard =
-        stack_guard;
-
-    process->user_code_size =
-        image_size;
-
-    process->context =
-        create_user_context(
-            kernel_stack_virtual,
-            code_virtual + entry_offset,
-            stack_virtual
         );
+    }
 
-    pid = process->pid;
+    if (loaded)
+    {
+        user_root =
+            paging_create_user_space();
+    }
 
-finish:
-    if (pid == 0)
+    bool mapped = false;
+
+    if (user_root != 0)
+    {
+        mapped =
+            paging_map_user_page_in(
+                user_root,
+                code_virtual,
+                (uint64_t)user_code_page,
+                false,
+                true
+            ) &&
+            paging_map_user_page_in(
+                user_root,
+                stack_virtual,
+                (uint64_t)user_stack_page,
+                true,
+                false
+            );
+    }
+
+    if (!mapped)
     {
         if (
             user_root != 0 &&
@@ -1053,23 +1192,70 @@ finish:
             );
         }
 
-        if (kernel_stack_page != NULL)
-        {
-            free_page(kernel_stack_page);
-        }
+        free_page(kernel_stack_page);
+        free_page(user_code_page);
+        free_page(user_stack_page);
 
-        if (user_code_page != NULL)
-        {
-            free_page(user_code_page);
-        }
-
-        if (user_stack_page != NULL)
-        {
-            free_page(user_stack_page);
-        }
+        spinlock_unlock_irqrestore(
+            &process_lock,
+            flags
+        );
+        return 0;
     }
 
-    interrupt_restore(interrupt_flags);
+    process_t *process =
+        &processes[slot];
+
+    clear_process(process);
+    process->pid = next_pid++;
+    process->parent_pid = parent_pid;
+    copy_name(
+        process->name,
+        path_name(path)
+    );
+    process->state = PROCESS_READY;
+    process->mode = PROCESS_USER;
+    process->uid = uid;
+    process->gid = gid;
+    process->capabilities = capabilities;
+    process->page_table_root = user_root;
+    process->kernel_stack_page =
+        kernel_stack_page;
+    process->kernel_stack_virtual =
+        kernel_stack_virtual;
+    process->kernel_stack_guard =
+        kernel_guard;
+    process->kernel_stack_top =
+        kernel_stack_virtual + PAGE_SIZE;
+    process->user_code_page =
+        user_code_page;
+    process->user_stack_page =
+        user_stack_page;
+    process->user_code_virtual =
+        code_virtual;
+    process->user_stack_virtual =
+        stack_virtual;
+    process->user_stack_guard =
+        stack_guard;
+    process->user_code_size = image_size;
+    process->context =
+        create_user_context(
+            kernel_stack_virtual,
+            code_virtual + entry_offset,
+            stack_virtual
+        );
+
+    uint64_t pid = process->pid;
+
+    spinlock_unlock_irqrestore(
+        &process_lock,
+        flags
+    );
+
+    dispatch_user_process(
+        (uint32_t)slot
+    );
+
     return pid;
 }
 
@@ -1092,6 +1278,13 @@ bool process_user_may_signal(uint64_t pid)
         return true;
     }
 
+    uint64_t flags =
+        spinlock_lock_irqsave(
+            &process_lock
+        );
+
+    bool allowed = false;
+
     for (
         uint32_t slot = 1;
         slot < PROCESS_MAX_COUNT;
@@ -1109,22 +1302,23 @@ bool process_user_may_signal(uint64_t pid)
             continue;
         }
 
-        if (
+        allowed =
             (current->capabilities &
-                SECURITY_CAP_PROCESS_ADMIN) != 0
-        )
-        {
-            return true;
-        }
-
-        return (
-            target->uid == current->uid &&
-            target->parent_pid ==
-                current->pid
-        );
+                SECURITY_CAP_PROCESS_ADMIN) != 0 ||
+            (
+                target->uid == current->uid &&
+                target->parent_pid ==
+                    current->pid
+            );
+        break;
     }
 
-    return false;
+    spinlock_unlock_irqrestore(
+        &process_lock,
+        flags
+    );
+
+    return allowed;
 }
 
 bool process_terminate(uint64_t pid)
@@ -1137,17 +1331,13 @@ bool process_terminate(uint64_t pid)
         return false;
     }
 
-    uint64_t flags;
+    uint64_t flags =
+        spinlock_lock_irqsave(
+            &process_lock
+        );
 
-    __asm__ volatile(
-        "pushfq\n"
-        "popq %0"
-        : "=r"(flags)
-    );
-
-    irq_disable();
-
-    bool terminated = false;
+    uint32_t target_slot = PROCESS_MAX_COUNT;
+    bool scheduler_enqueued = false;
 
     for (
         uint32_t slot = 1;
@@ -1166,31 +1356,75 @@ bool process_terminate(uint64_t pid)
             continue;
         }
 
-        if (slot != current_index)
-        {
-            process->state =
-                PROCESS_TERMINATED;
-
-            destroy_process_slot(slot);
-            terminated = true;
-        }
-
+        target_slot = slot;
+        scheduler_enqueued =
+            process->scheduler_enqueued;
         break;
     }
 
-    if (flags & (1ULL << 9))
+    if (target_slot >= PROCESS_MAX_COUNT)
     {
-        irq_enable();
+        spinlock_unlock_irqrestore(
+            &process_lock,
+            flags
+        );
+        return false;
     }
 
-    return terminated;
+    if (scheduler_enqueued)
+    {
+        processes[target_slot]
+            .terminate_requested = true;
+
+        spinlock_unlock_irqrestore(
+            &process_lock,
+            flags
+        );
+
+        return smp_scheduler_request_process_stop(
+            target_slot,
+            pid,
+            -9
+        );
+    }
+
+    if (target_slot == bsp_current_index)
+    {
+        spinlock_unlock_irqrestore(
+            &process_lock,
+            flags
+        );
+        return false;
+    }
+
+    processes[target_slot].state =
+        PROCESS_TERMINATED;
+    processes[target_slot].running_cpu =
+        PROCESS_CPU_NONE;
+    destroy_process_slot_locked(
+        target_slot
+    );
+
+    spinlock_unlock_irqrestore(
+        &process_lock,
+        flags
+    );
+
+    return true;
 }
 
 cpu_context_t *process_schedule_on_timer(
     cpu_context_t *context
 )
 {
-    return schedule(
+    if (current_cpu_index() != 0)
+    {
+        return smp_scheduler_handle_timer(
+            context
+        );
+    }
+
+    return schedule_bsp(
         context,
         true
     );
@@ -1200,7 +1434,14 @@ cpu_context_t *process_schedule_now(
     cpu_context_t *context
 )
 {
-    return schedule(
+    if (current_cpu_index() != 0)
+    {
+        return smp_scheduler_handle_yield(
+            context
+        );
+    }
+
+    return schedule_bsp(
         context,
         false
     );
@@ -1213,20 +1454,49 @@ cpu_context_t *process_exit_from_syscall(
 {
     if (
         !initialized ||
-        current_index == 0
+        context == NULL
     )
     {
         return context;
     }
 
+    uint32_t cpu_index =
+        current_cpu_index();
+    uint32_t slot =
+        current_slot_unlocked();
+
+    if (slot == 0 || slot >= PROCESS_MAX_COUNT)
+    {
+        return context;
+    }
+
+    uint64_t flags =
+        spinlock_lock_irqsave(
+            &process_lock
+        );
+
     process_t *current =
-        &processes[current_index];
+        &processes[slot];
 
     current->context = context;
     current->exit_status = status;
     current->state = PROCESS_TERMINATED;
+    current->running_cpu = PROCESS_CPU_NONE;
 
-    return schedule(
+    spinlock_unlock_irqrestore(
+        &process_lock,
+        flags
+    );
+
+    if (cpu_index != 0)
+    {
+        return smp_scheduler_exit_current_user(
+            context,
+            status
+        );
+    }
+
+    return schedule_bsp(
         context,
         false
     );
@@ -1241,15 +1511,24 @@ cpu_context_t *process_fault_from_exception(
 {
     if (
         !initialized ||
-        current_index == 0 ||
         context == NULL
     )
     {
         return context;
     }
 
+    uint32_t cpu_index =
+        current_cpu_index();
+    uint32_t slot =
+        current_slot_unlocked();
+
+    if (slot == 0 || slot >= PROCESS_MAX_COUNT)
+    {
+        return context;
+    }
+
     process_t *current =
-        &processes[current_index];
+        &processes[slot];
 
     if (current->mode != PROCESS_USER)
     {
@@ -1259,22 +1538,42 @@ cpu_context_t *process_fault_from_exception(
     klogf(
         KLOG_WARNING,
         "process",
-        "terminated user pid=%llu name=%s exception=%llu error=0x%llx address=0x%llx",
+        "terminated user pid=%llu name=%s cpu=%u exception=%llu error=0x%llx address=0x%llx",
         (unsigned long long)current->pid,
         current->name,
+        (unsigned int)cpu_index,
         (unsigned long long)vector,
         (unsigned long long)error_code,
         (unsigned long long)fault_address
     );
 
-    current->context = context;
-    current->exit_status =
+    int64_t status =
         -(int64_t)(256 + vector);
 
-    current->state =
-        PROCESS_TERMINATED;
+    uint64_t flags =
+        spinlock_lock_irqsave(
+            &process_lock
+        );
 
-    return schedule(
+    current->context = context;
+    current->exit_status = status;
+    current->state = PROCESS_TERMINATED;
+    current->running_cpu = PROCESS_CPU_NONE;
+
+    spinlock_unlock_irqrestore(
+        &process_lock,
+        flags
+    );
+
+    if (cpu_index != 0)
+    {
+        return smp_scheduler_exit_current_user(
+            context,
+            status
+        );
+    }
+
+    return schedule_bsp(
         context,
         false
     );
@@ -1284,11 +1583,24 @@ void process_exit_current(void)
 {
     irq_disable();
 
-    if (current_index != 0)
+    if (current_cpu_index() != 0)
     {
-        processes[current_index].state =
-            PROCESS_TERMINATED;
+        smp_scheduler_exit_current(0);
     }
+
+    uint32_t slot = bsp_current_index;
+
+    spinlock_lock(&process_lock);
+
+    if (slot != 0)
+    {
+        processes[slot].state =
+            PROCESS_TERMINATED;
+        processes[slot].running_cpu =
+            PROCESS_CPU_NONE;
+    }
+
+    spinlock_unlock(&process_lock);
 
     __asm__ volatile(
         "int $0x81"
@@ -1356,22 +1668,37 @@ bool process_user_range_valid(
 
 uint32_t process_count(void)
 {
+    if (!initialized)
+    {
+        return 0;
+    }
+
+    uint64_t flags =
+        spinlock_lock_irqsave(
+            &process_lock
+        );
+
     uint32_t count = 0;
 
     for (
-        uint32_t index = 0;
-        index < PROCESS_MAX_COUNT;
-        index++
+        uint32_t slot = 0;
+        slot < PROCESS_MAX_COUNT;
+        slot++
     )
     {
         if (
-            processes[index].state !=
-            PROCESS_UNUSED
+            processes[slot].state !=
+                PROCESS_UNUSED
         )
         {
             count++;
         }
     }
+
+    spinlock_unlock_irqrestore(
+        &process_lock,
+        flags
+    );
 
     return count;
 }
@@ -1380,6 +1707,11 @@ const process_t *process_get(
     uint32_t index
 )
 {
+    if (!initialized)
+    {
+        return NULL;
+    }
+
     uint32_t current = 0;
 
     for (
@@ -1390,7 +1722,7 @@ const process_t *process_get(
     {
         if (
             processes[slot].state ==
-            PROCESS_UNUSED
+                PROCESS_UNUSED
         )
         {
             continue;
@@ -1414,25 +1746,41 @@ const process_t *process_current(void)
         return NULL;
     }
 
-    return &processes[current_index];
+    uint32_t slot =
+        current_slot_unlocked();
+
+    if (slot >= PROCESS_MAX_COUNT)
+    {
+        return NULL;
+    }
+
+    return &processes[slot];
 }
 
 void process_print_all(void)
 {
     terminal_write_line(
-        "PID  MODE    STATE       TICKS  SWITCHES  NAME"
+        "PID  CPU  MODE    STATE       TICKS  SWITCHES  NAME"
     );
 
+    uint64_t flags =
+        spinlock_lock_irqsave(
+            &process_lock
+        );
+
     for (
-        uint32_t index = 0;
-        index < process_count();
-        index++
+        uint32_t slot = 0;
+        slot < PROCESS_MAX_COUNT;
+        slot++
     )
     {
         const process_t *process =
-            process_get(index);
+            &processes[slot];
 
-        if (process == NULL)
+        if (
+            process->state ==
+                PROCESS_UNUSED
+        )
         {
             continue;
         }
@@ -1443,27 +1791,39 @@ void process_print_all(void)
             process->pid,
             number
         );
-
         terminal_write(number);
         terminal_write("    ");
+
+        if (
+            process->assigned_cpu ==
+                PROCESS_CPU_NONE
+        )
+        {
+            terminal_write("-    ");
+        }
+        else
+        {
+            uint64_to_string(
+                process->assigned_cpu,
+                number
+            );
+            terminal_write(number);
+            terminal_write("    ");
+        }
 
         terminal_write(
             mode_name(process->mode)
         );
-
         terminal_write("    ");
-
         terminal_write(
             state_name(process->state)
         );
-
         terminal_write("    ");
 
         uint64_to_string(
             process->cpu_ticks,
             number
         );
-
         terminal_write(number);
         terminal_write("      ");
 
@@ -1471,28 +1831,34 @@ void process_print_all(void)
             process->switches,
             number
         );
-
         terminal_write(number);
         terminal_write("         ");
-
-        terminal_write_line(
-            process->name
-        );
+        terminal_write_line(process->name);
     }
+
+    spinlock_unlock_irqrestore(
+        &process_lock,
+        flags
+    );
 }
 
 uint32_t process_guarded_stack_count(void)
 {
+    uint64_t flags =
+        spinlock_lock_irqsave(
+            &process_lock
+        );
+
     uint32_t count = 0;
 
     for (
-        uint32_t index = 1;
-        index < PROCESS_MAX_COUNT;
-        index++
+        uint32_t slot = 1;
+        slot < PROCESS_MAX_COUNT;
+        slot++
     )
     {
         const process_t *process =
-            &processes[index];
+            &processes[slot];
 
         if (
             process->state != PROCESS_UNUSED &&
@@ -1503,19 +1869,31 @@ uint32_t process_guarded_stack_count(void)
         }
     }
 
+    spinlock_unlock_irqrestore(
+        &process_lock,
+        flags
+    );
+
     return count;
 }
 
 bool process_guard_pages_validate(void)
 {
+    uint64_t flags =
+        spinlock_lock_irqsave(
+            &process_lock
+        );
+
+    bool valid = true;
+
     for (
-        uint32_t index = 1;
-        index < PROCESS_MAX_COUNT;
-        index++
+        uint32_t slot = 1;
+        slot < PROCESS_MAX_COUNT;
+        slot++
     )
     {
         const process_t *process =
-            &processes[index];
+            &processes[slot];
 
         if (process->state == PROCESS_UNUSED)
         {
@@ -1533,7 +1911,8 @@ bool process_guard_pages_validate(void)
             )
         )
         {
-            return false;
+            valid = false;
+            break;
         }
 
         if (
@@ -1551,10 +1930,15 @@ bool process_guard_pages_validate(void)
             )
         )
         {
-            return false;
+            valid = false;
+            break;
         }
     }
 
-    return true;
-}
+    spinlock_unlock_irqrestore(
+        &process_lock,
+        flags
+    );
 
+    return valid;
+}

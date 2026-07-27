@@ -1,14 +1,108 @@
 #include "block_device.h"
 
+#include "spinlock.h"
+
 #include <stddef.h>
 #include <stdint.h>
 
 static block_device_t devices[BLOCK_DEVICE_MAX];
-static uint32_t device_count;
+static uint32_t device_slots;
+static spinlock_t registry_lock;
+
+static bool device_online(
+    const block_device_t *device
+)
+{
+    return device != NULL &&
+        __atomic_load_n(
+            &device->online,
+            __ATOMIC_ACQUIRE
+        );
+}
+
+static bool device_acquire(
+    const block_device_t *device
+)
+{
+    if (!device_online(device))
+    {
+        return false;
+    }
+
+    __atomic_add_fetch(
+        &((block_device_t *)device)->io_references,
+        1U,
+        __ATOMIC_ACQ_REL
+    );
+
+    if (!device_online(device))
+    {
+        __atomic_sub_fetch(
+            &((block_device_t *)device)->io_references,
+            1U,
+            __ATOMIC_RELEASE
+        );
+
+        return false;
+    }
+
+    return true;
+}
+
+static void device_release(
+    const block_device_t *device
+)
+{
+    __atomic_sub_fetch(
+        &((block_device_t *)device)->io_references,
+        1U,
+        __ATOMIC_RELEASE
+    );
+}
+
+static bool string_starts_with(
+    const char *text,
+    const char *prefix
+)
+{
+    if (text == NULL || prefix == NULL)
+    {
+        return false;
+    }
+
+    uint32_t index = 0;
+
+    while (prefix[index] != '\0')
+    {
+        if (text[index] != prefix[index])
+        {
+            return false;
+        }
+
+        index++;
+    }
+
+    return true;
+}
 
 void block_device_init(void)
 {
-    device_count = 0;
+    device_slots = 0;
+    spinlock_init(&registry_lock);
+
+    for (
+        uint32_t index = 0;
+        index < BLOCK_DEVICE_MAX;
+        index++
+    )
+    {
+        __atomic_store_n(
+            &devices[index].online,
+            false,
+            __ATOMIC_RELEASE
+        );
+        devices[index].io_references = 0;
+    }
 }
 
 bool block_device_register(
@@ -20,29 +114,126 @@ bool block_device_register(
         device->name == NULL ||
         device->sector_size == 0 ||
         device->sector_count == 0 ||
-        device->read == NULL ||
-        device_count >= BLOCK_DEVICE_MAX
+        device->read == NULL
     )
     {
         return false;
     }
 
-    devices[device_count] = *device;
-    device_count++;
+    uint64_t flags =
+        spinlock_lock_irqsave(&registry_lock);
+
+    uint32_t selected = BLOCK_DEVICE_MAX;
+
+    if (device->context != NULL)
+    {
+        for (
+            uint32_t index = 0;
+            index < device_slots;
+            index++
+        )
+        {
+            if (devices[index].context == device->context)
+            {
+                selected = index;
+                break;
+            }
+        }
+    }
+
+    if (selected == BLOCK_DEVICE_MAX)
+    {
+        for (
+            uint32_t index = 0;
+            index < device_slots;
+            index++
+        )
+        {
+            if (!device_online(&devices[index]))
+            {
+                selected = index;
+                break;
+            }
+        }
+    }
+
+    if (selected == BLOCK_DEVICE_MAX)
+    {
+        if (device_slots >= BLOCK_DEVICE_MAX)
+        {
+            spinlock_unlock_irqrestore(
+                &registry_lock,
+                flags
+            );
+
+            return false;
+        }
+
+        selected = device_slots++;
+    }
+
+    devices[selected] = *device;
+    devices[selected].io_references = 0;
+    devices[selected].removable =
+        device->removable ||
+        string_starts_with(
+            device->name,
+            "USB mass storage"
+        );
+    __atomic_store_n(
+        &devices[selected].online,
+        true,
+        __ATOMIC_RELEASE
+    );
+
+    spinlock_unlock_irqrestore(
+        &registry_lock,
+        flags
+    );
 
     return true;
 }
 
 uint32_t block_device_count(void)
 {
-    return device_count;
+    return device_slots;
+}
+
+uint32_t block_device_online_count(void)
+{
+    uint64_t flags =
+        spinlock_lock_irqsave(&registry_lock);
+
+    uint32_t count = 0;
+
+    for (
+        uint32_t index = 0;
+        index < device_slots;
+        index++
+    )
+    {
+        if (device_online(&devices[index]))
+        {
+            count++;
+        }
+    }
+
+    spinlock_unlock_irqrestore(
+        &registry_lock,
+        flags
+    );
+
+    return count;
 }
 
 const block_device_t *block_device_get(
     uint32_t index
 )
 {
-    if (index >= device_count)
+    if (
+        index >= device_slots ||
+        !device_online(&devices[index])
+    )
     {
         return NULL;
     }
@@ -52,7 +243,123 @@ const block_device_t *block_device_get(
 
 const block_device_t *block_device_primary(void)
 {
-    return block_device_get(0);
+    for (
+        uint32_t index = 0;
+        index < device_slots;
+        index++
+    )
+    {
+        const block_device_t *device =
+            block_device_get(index);
+
+        if (device != NULL)
+        {
+            return device;
+        }
+    }
+
+    return NULL;
+}
+
+const block_device_t *block_device_find_context(
+    const void *context
+)
+{
+    if (context == NULL)
+    {
+        return NULL;
+    }
+
+    for (
+        uint32_t index = 0;
+        index < device_slots;
+        index++
+    )
+    {
+        if (
+            device_online(&devices[index]) &&
+            devices[index].context == context
+        )
+        {
+            return &devices[index];
+        }
+    }
+
+    return NULL;
+}
+
+uint32_t block_device_unregister_prefix(
+    const char *name_prefix
+)
+{
+    if (
+        name_prefix == NULL ||
+        name_prefix[0] == '\0'
+    )
+    {
+        return 0;
+    }
+
+    uint64_t flags =
+        spinlock_lock_irqsave(&registry_lock);
+
+    uint32_t removed = 0;
+
+    for (
+        uint32_t index = 0;
+        index < device_slots;
+        index++
+    )
+    {
+        if (
+            device_online(&devices[index]) &&
+            string_starts_with(
+                devices[index].name,
+                name_prefix
+            )
+        )
+        {
+            __atomic_store_n(
+                &devices[index].online,
+                false,
+                __ATOMIC_RELEASE
+            );
+            removed++;
+        }
+    }
+
+    spinlock_unlock_irqrestore(
+        &registry_lock,
+        flags
+    );
+
+    for (
+        uint32_t index = 0;
+        index < device_slots;
+        index++
+    )
+    {
+        if (
+            !device_online(&devices[index]) &&
+            string_starts_with(
+                devices[index].name,
+                name_prefix
+            )
+        )
+        {
+            while (
+                __atomic_load_n(
+                    &devices[index].io_references,
+                    __ATOMIC_ACQUIRE
+                ) != 0
+            )
+            {
+                __asm__ volatile("pause");
+            }
+        }
+    }
+
+    return removed;
 }
 
 bool block_device_read(
@@ -68,18 +375,22 @@ bool block_device_read(
         buffer == NULL ||
         sector_count == 0 ||
         lba >= device->sector_count ||
-        sector_count > device->sector_count - lba
+        sector_count > device->sector_count - lba ||
+        !device_acquire(device)
     )
     {
         return false;
     }
 
-    return device->read(
+    bool success = device->read(
         device->context,
         lba,
         sector_count,
         buffer
     );
+
+    device_release(device);
+    return success;
 }
 
 bool block_device_write(
@@ -96,16 +407,20 @@ bool block_device_write(
         buffer == NULL ||
         sector_count == 0 ||
         lba >= device->sector_count ||
-        sector_count > device->sector_count - lba
+        sector_count > device->sector_count - lba ||
+        !device_acquire(device)
     )
     {
         return false;
     }
 
-    return device->write(
+    bool success = device->write(
         device->context,
         lba,
         sector_count,
         buffer
     );
+
+    device_release(device);
+    return success;
 }

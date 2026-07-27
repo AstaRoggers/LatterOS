@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define PAGING_TLB_IPI_VECTOR 0xF3
+
 uint64_t paging_kernel_root(void);
 uint64_t paging_current_root(void);
 
@@ -58,5 +60,11 @@ bool paging_user_range_valid(
     size_t size,
     bool writable
 );
+
+bool paging_run_shootdown_self_test(void);
+
+void paging_register_current_cpu(void);
+void paging_handle_tlb_ipi(void);
+void paging_print_status(void);
 
 #endif

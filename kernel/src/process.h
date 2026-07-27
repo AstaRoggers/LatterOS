@@ -11,6 +11,7 @@
 #define PROCESS_NAME_LENGTH 32
 #define PROCESS_MAX_COUNT   16
 #define PROCESS_MAX_FILES   8
+#define PROCESS_CPU_NONE    UINT32_MAX
 
 typedef enum
 {
@@ -68,6 +69,17 @@ typedef struct
     int64_t exit_status;
     uint64_t cpu_ticks;
     uint64_t switches;
+
+    uint32_t assigned_cpu;
+    uint32_t running_cpu;
+    bool smp_managed;
+    bool scheduler_enqueued;
+    bool terminate_requested;
+    uint8_t reserved0;
+    uint64_t scheduler_thread_id;
+    uint32_t retired_cpu;
+    uint32_t reserved1;
+    uint64_t retired_sequence;
 } process_t;
 
 void process_init(void);
