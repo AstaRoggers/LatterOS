@@ -2,6 +2,7 @@
 
 #include "app_suite.h"
 #include "boot_mode.h"
+#include "boot_health.h"
 #include "compositor.h"
 #include "desktop_dialog.h"
 #include "desktop_editor.h"
@@ -18,6 +19,7 @@
 #include "process.h"
 #include "recovery.h"
 #include "release_info.h"
+#include "stability_monitor.h"
 #include "rtc.h"
 #include "security.h"
 #include "shell.h"
@@ -86,6 +88,8 @@
 #define FILE_DRAG_THRESHOLD 8
 #define INSTALLER_VISIBLE_ROWS 6U
 #define INSTALLER_STATUS_CAPACITY 160U
+#define LAYOUT_AUTOSAVE_DELAY_MS 900U
+#define DESKTOP_REPORT_CAPACITY 4096U
 
 #define COLOR_TERMINAL 0x101820U
 #define COLOR_TERMINAL_TEXT 0xD6F5D6U
@@ -290,12 +294,26 @@ typedef enum
 {
     SETTINGS_PAGE_APPEARANCE,
     SETTINGS_PAGE_PACKAGES,
-    SETTINGS_PAGE_HARDWARE
+    SETTINGS_PAGE_HARDWARE,
+    SETTINGS_PAGE_STABILITY,
+    SETTINGS_PAGE_DESKTOP,
+    SETTINGS_PAGE_COUNT
 } settings_page_t;
 
 static settings_page_t settings_page;
 static bool animations_enabled;
 static bool first_boot_notification_pending;
+static stability_state_t visible_stability_state;
+
+static ui_rect_t observed_layout[GUI_WINDOW_COUNT];
+static bool layout_observer_ready;
+static bool layout_autosave_pending;
+static uint64_t layout_autosave_deadline;
+static uint64_t layout_autosave_count;
+static uint64_t launcher_clean_launch_count;
+static uint64_t animation_surface_recovery_count;
+static uint64_t manual_surface_rebuild_count;
+static bool force_fresh_activation;
 
 typedef struct
 {
@@ -358,6 +376,7 @@ static void build_node_path(
     size_t capacity
 );
 static void save_window_layout(void);
+static void update_layout_autosave(void);
 static void rebuild_launcher_items(void);
 static void show_editor_save_as_dialog(void);
 static void show_installer_confirmation(void);
@@ -1267,32 +1286,301 @@ static void rebuild_launcher_items(void)
     }
 }
 
-static void save_window_layout(void)
+static const ui_rect_t *persisted_window_bounds(uint32_t index)
+{
+    if (index >= GUI_WINDOW_COUNT)
+    {
+        return NULL;
+    }
+
+    const wm_window_state_t *state = &windows[index].state;
+
+    if (
+        state->maximized ||
+        state->fullscreen ||
+        state->snap != WM_SNAP_NONE
+    )
+    {
+        return &state->restore_bounds;
+    }
+
+    return &state->bounds;
+}
+
+static bool rectangles_equal(
+    const ui_rect_t *first,
+    const ui_rect_t *second
+)
+{
+    return
+        first != NULL &&
+        second != NULL &&
+        first->x == second->x &&
+        first->y == second->y &&
+        first->width == second->width &&
+        first->height == second->height;
+}
+
+static void refresh_layout_observer(void)
 {
     for (uint32_t index = 0; index < GUI_WINDOW_COUNT; index++)
     {
-        const wm_window_state_t *state = &windows[index].state;
-        const ui_rect_t *bounds = &state->bounds;
+        const ui_rect_t *bounds = persisted_window_bounds(index);
 
-        if (
-            state->maximized ||
-            state->snap != WM_SNAP_NONE
-        )
+        if (bounds != NULL)
         {
-            bounds = &state->restore_bounds;
+            observed_layout[index] = *bounds;
+        }
+    }
+
+    layout_observer_ready = true;
+}
+
+static bool save_window_layout_internal(
+    bool notify_user,
+    bool automatic
+)
+{
+    for (uint32_t index = 0; index < GUI_WINDOW_COUNT; index++)
+    {
+        const ui_rect_t *bounds = persisted_window_bounds(index);
+
+        if (bounds != NULL)
+        {
+            desktop_services_store_window(index, bounds);
+        }
+    }
+
+    bool saved = desktop_services_save();
+
+    if (saved)
+    {
+        if (automatic)
+        {
+            layout_autosave_count++;
         }
 
-        desktop_services_store_window(index, bounds);
+        refresh_layout_observer();
+        layout_autosave_pending = false;
     }
 
-    if (desktop_services_save())
+    if (notify_user)
     {
-        desktop_notify("Desktop layout saved", 3500U);
+        desktop_notify(
+            saved ? "Desktop layout saved" :
+                "Unable to save desktop layout",
+            saved ? 3500U : 5000U
+        );
     }
-    else
+
+    return saved;
+}
+
+static void save_window_layout(void)
+{
+    (void)save_window_layout_internal(true, false);
+}
+
+static void update_layout_autosave(void)
+{
+    if (!layout_observer_ready)
     {
-        desktop_notify("Unable to save desktop layout", 5000U);
+        refresh_layout_observer();
+        return;
     }
+
+    bool changed = false;
+
+    for (uint32_t index = 0; index < GUI_WINDOW_COUNT; index++)
+    {
+        const ui_rect_t *bounds = persisted_window_bounds(index);
+
+        if (
+            bounds != NULL &&
+            !rectangles_equal(bounds, &observed_layout[index])
+        )
+        {
+            observed_layout[index] = *bounds;
+            changed = true;
+        }
+    }
+
+    uint64_t ticks = timer_ticks();
+    uint32_t frequency = timer_frequency();
+
+    if (changed)
+    {
+        uint64_t delay_ticks = frequency == 0U ?
+            1ULL :
+            ((uint64_t)frequency * LAYOUT_AUTOSAVE_DELAY_MS + 999ULL) /
+                1000ULL;
+
+        if (delay_ticks == 0ULL)
+        {
+            delay_ticks = 1ULL;
+        }
+
+        layout_autosave_pending = true;
+        layout_autosave_deadline = ticks + delay_ticks;
+    }
+
+    if (
+        layout_autosave_pending &&
+        ticks >= layout_autosave_deadline
+    )
+    {
+        (void)save_window_layout_internal(false, true);
+    }
+}
+
+static void reset_window_positions(void)
+{
+    uint32_t screen_width = graphics_width();
+    uint32_t screen_height = graphics_height();
+
+    static const int32_t x_offsets[GUI_WINDOW_COUNT] = {
+        -390, -220, -280, -155, -200, -185, -280, -310
+    };
+
+    static const int32_t y_positions[GUI_WINDOW_COUNT] = {
+        70, 90, 70, 100, 90, 115, 100, 86
+    };
+
+    static const uint32_t widths[GUI_WINDOW_COUNT] = {
+        650U, 620U, 580U, 320U, 420U, 470U, 580U, 620U
+    };
+
+    static const uint32_t heights[GUI_WINDOW_COUNT] = {
+        390U, 500U, 430U, 350U, 330U, 410U, 360U, 420U
+    };
+
+    for (uint32_t index = 0; index < GUI_WINDOW_COUNT; index++)
+    {
+        wm_window_state_t *state = &windows[index].state;
+        ui_rect_t bounds = {
+            .x = (int32_t)(screen_width / 2U) + x_offsets[index],
+            .y = y_positions[index],
+            .width = widths[index],
+            .height = heights[index]
+        };
+
+        state->bounds = bounds;
+        state->restore_bounds = bounds;
+        state->maximized = false;
+        state->fullscreen = false;
+        state->snap = WM_SNAP_NONE;
+        state->pending_snap = WM_SNAP_NONE;
+        wm_cancel_interaction(state);
+
+        wm_clamp_window(
+            state,
+            screen_width,
+            screen_height,
+            TASKBAR_HEIGHT
+        );
+
+        state->restore_bounds = state->bounds;
+        window_animation_cancel(index);
+        animation_target_valid[index] = false;
+        window_surface_invalidate(index);
+    }
+
+    drag_cache_valid = false;
+    compositor_invalidate_all();
+    (void)save_window_layout_internal(false, false);
+    desktop_notify("Window positions reset and saved", 4500U);
+}
+
+static bool write_desktop_reliability_report(void)
+{
+    char report[DESKTOP_REPORT_CAPACITY];
+    report[0] = '\0';
+
+    append_text(report, sizeof(report), "LatterOS Desktop Reliability Report\n");
+    append_text(report, sizeof(report), "Release: ");
+    append_text(report, sizeof(report), release_info_version());
+    append_text(report, sizeof(report), " / Milestone ");
+    append_text(report, sizeof(report), release_info_milestone());
+    append_text(report, sizeof(report), "\n\n");
+
+    append_text(report, sizeof(report), "Launcher fresh-surface launches: ");
+    append_unsigned_decimal(
+        report,
+        sizeof(report),
+        launcher_clean_launch_count
+    );
+    append_text(report, sizeof(report), "\nAnimation surface recoveries: ");
+    append_unsigned_decimal(
+        report,
+        sizeof(report),
+        animation_surface_recovery_count
+    );
+    append_text(report, sizeof(report), "\nManual surface rebuilds: ");
+    append_unsigned_decimal(
+        report,
+        sizeof(report),
+        manual_surface_rebuild_count
+    );
+    append_text(report, sizeof(report), "\nAutomatic layout saves: ");
+    append_unsigned_decimal(report, sizeof(report), layout_autosave_count);
+    append_text(report, sizeof(report), "\nLayout autosave pending: ");
+    append_text(
+        report,
+        sizeof(report),
+        layout_autosave_pending ? "yes" : "no"
+    );
+
+    append_text(report, sizeof(report), "\n\nWindow surface captures: ");
+    append_unsigned_decimal(
+        report,
+        sizeof(report),
+        window_surface_total_captures()
+    );
+    append_text(report, sizeof(report), "\nWindow surface draws: ");
+    append_unsigned_decimal(
+        report,
+        sizeof(report),
+        window_surface_total_draws()
+    );
+    append_text(report, sizeof(report), "\nWindow surface scaled draws: ");
+    append_unsigned_decimal(
+        report,
+        sizeof(report),
+        window_surface_total_scaled_draws()
+    );
+
+    append_text(report, sizeof(report), "\n\nCompositor backend: ");
+    append_text(report, sizeof(report), compositor_display_backend());
+    append_text(report, sizeof(report), "\nCompositor frames: ");
+    append_unsigned_decimal(
+        report,
+        sizeof(report),
+        compositor_frame_count()
+    );
+    append_text(report, sizeof(report), "\nRecent active FPS: ");
+    append_unsigned_decimal(
+        report,
+        sizeof(report),
+        compositor_recent_active_fps()
+    );
+    append_text(report, sizeof(report), "\nDropped frames: ");
+    append_unsigned_decimal(
+        report,
+        sizeof(report),
+        compositor_dropped_frame_count()
+    );
+    append_text(report, sizeof(report), "\nTriple buffered: ");
+    append_text(
+        report,
+        sizeof(report),
+        compositor_triple_buffered() ? "yes" : "no"
+    );
+    append_text(report, sizeof(report), "\n");
+
+    return vfs_write_text(
+        "/home/user/Documents/Desktop Reliability Report.txt",
+        report
+    );
 }
 
 static bool destination_path_for_node(
@@ -2039,7 +2327,13 @@ static void activate_window(uint8_t index)
 
     close_popup_menu();
 
+    if (force_fresh_activation)
+    {
+        window_surface_invalidate(index);
+    }
+
     if (
+        !force_fresh_activation &&
         (was_minimized || !was_visible) &&
         window_surface_valid_for(
             index,
@@ -4732,7 +5026,10 @@ static ui_rect_t desktop_settings_tab_button(
 )
 {
     uint32_t gap = 8U;
-    uint32_t width = (content->width - 52U) / 3U;
+    uint32_t width =
+        (content->width - 36U -
+            gap * (SETTINGS_PAGE_COUNT - 1U)) /
+        SETTINGS_PAGE_COUNT;
 
     return (ui_rect_t){
         .x = content->x + 18 +
@@ -4833,18 +5130,56 @@ static ui_rect_t desktop_settings_hardware_action_button(
     };
 }
 
+static ui_rect_t desktop_settings_stability_action_button(
+    const ui_rect_t *content,
+    uint32_t index
+)
+{
+    uint32_t gap = 8U;
+    uint32_t width = (content->width - 52U) / 3U;
+
+    return (ui_rect_t){
+        .x = content->x + 18 +
+            (int32_t)index * (int32_t)(width + gap),
+        .y = content->y + 322,
+        .width = width,
+        .height = 30U
+    };
+}
+
+static ui_rect_t desktop_settings_desktop_action_button(
+    const ui_rect_t *content,
+    uint32_t index
+)
+{
+    uint32_t column = index % 2U;
+    uint32_t row = index / 2U;
+    uint32_t gap = 10U;
+    uint32_t width = (content->width - 46U) / 2U;
+
+    return (ui_rect_t){
+        .x = content->x + 18 +
+            (int32_t)column * (int32_t)(width + gap),
+        .y = content->y + 276 + (int32_t)row * 42,
+        .width = width,
+        .height = 32U
+    };
+}
+
 static void desktop_settings_render_tabs(
     const ui_rect_t *content,
     const ui_palette_t *palette
 )
 {
-    static const char *labels[3] = {
-        "Appearance",
+    static const char *labels[SETTINGS_PAGE_COUNT] = {
+        "Look",
         "Packages",
-        "Hardware"
+        "Hardware",
+        "Stability",
+        "Desktop"
     };
 
-    for (uint32_t index = 0; index < 3U; index++)
+    for (uint32_t index = 0; index < SETTINGS_PAGE_COUNT; index++)
     {
         ui_rect_t tab = desktop_settings_tab_button(content, index);
 
@@ -5099,7 +5434,9 @@ static void desktop_settings_render_hardware(
     );
 
     line[0] = '\0';
-    append_text(line, sizeof(line), "CPU: ");
+    append_text(line, sizeof(line), "Platform: ");
+    append_text(line, sizeof(line), snapshot->hypervisor_name);
+    append_text(line, sizeof(line), " | CPU: ");
     append_text(line, sizeof(line), snapshot->cpu_brand);
     desktop_settings_draw_hardware_line(content, palette, 106, line, true);
 
@@ -5217,6 +5554,298 @@ static void desktop_settings_render_hardware(
     );
 }
 
+static void desktop_settings_render_stability(
+    const ui_rect_t *content,
+    const ui_palette_t *palette
+)
+{
+    const stability_snapshot_t *snapshot =
+        stability_monitor_snapshot();
+
+    char line[192];
+    line[0] = '\0';
+    append_text(line, sizeof(line), "System stability: ");
+    append_text(line, sizeof(line), stability_monitor_state_name());
+    desktop_settings_draw_hardware_line(
+        content,
+        palette,
+        60,
+        line,
+        true
+    );
+
+    line[0] = '\0';
+    append_text(line, sizeof(line), "Boot profile/source: ");
+    append_text(line, sizeof(line), boot_mode_name());
+    append_text(line, sizeof(line), " / ");
+    append_text(line, sizeof(line), boot_source_name());
+    desktop_settings_draw_hardware_line(
+        content,
+        palette,
+        80,
+        line,
+        false
+    );
+
+    desktop_settings_draw_hardware_line(
+        content,
+        palette,
+        100,
+        stability_monitor_stage(),
+        false
+    );
+
+    ui_rect_t progress_border = {
+        .x = content->x + 18,
+        .y = content->y + 124,
+        .width = content->width - 36U,
+        .height = 16U
+    };
+    ui_fill_rect(&progress_border, palette->field);
+    ui_draw_border(&progress_border, palette->border, 1U);
+
+    ui_rect_t progress_fill = {
+        .x = progress_border.x + 2,
+        .y = progress_border.y + 2,
+        .width = ((progress_border.width - 4U) * snapshot->progress) / 100U,
+        .height = progress_border.height - 4U
+    };
+
+    if (progress_fill.width != 0U)
+    {
+        ui_fill_rect(&progress_fill, palette->accent);
+    }
+
+    line[0] = '\0';
+    append_text(line, sizeof(line), "Progress: ");
+    append_unsigned_decimal(line, sizeof(line), snapshot->progress);
+    append_text(line, sizeof(line), "%  uptime=");
+    append_unsigned_decimal(
+        line,
+        sizeof(line),
+        (uint32_t)snapshot->uptime_seconds
+    );
+    append_text(line, sizeof(line), "s  timer=");
+    append_unsigned_decimal(line, sizeof(line), snapshot->timer_frequency);
+    append_text(line, sizeof(line), " Hz");
+    desktop_settings_draw_hardware_line(content, palette, 150, line, false);
+
+    line[0] = '\0';
+    append_text(line, sizeof(line), "Timer/memory passed: ");
+    append_text(line, sizeof(line), snapshot->timer_passed ? "yes" : "no");
+    append_text(line, sizeof(line), "/");
+    append_text(line, sizeof(line), snapshot->memory_passed ? "yes" : "no");
+    desktop_settings_draw_hardware_line(content, palette, 174, line, false);
+
+    line[0] = '\0';
+    append_text(line, sizeof(line), "Block devices online/invalid: ");
+    append_unsigned_decimal(line, sizeof(line), snapshot->online_block_devices);
+    append_text(line, sizeof(line), "/");
+    append_unsigned_decimal(line, sizeof(line), snapshot->invalid_block_devices);
+    desktop_settings_draw_hardware_line(content, palette, 194, line, false);
+
+    line[0] = '\0';
+    append_text(line, sizeof(line), "AP scheduler submitted/completed: ");
+    append_text(line, sizeof(line), snapshot->smp_submitted ? "yes" : "no");
+    append_text(line, sizeof(line), "/");
+    append_text(line, sizeof(line), snapshot->smp_completed ? "yes" : "no");
+    desktop_settings_draw_hardware_line(content, palette, 214, line, false);
+
+    line[0] = '\0';
+    append_text(line, sizeof(line), "Display presented/dropped/failures: ");
+    append_unsigned_decimal(
+        line,
+        sizeof(line),
+        (uint32_t)snapshot->display_presented_frames
+    );
+    append_text(line, sizeof(line), "/");
+    append_unsigned_decimal(
+        line,
+        sizeof(line),
+        (uint32_t)snapshot->display_dropped_frames
+    );
+    append_text(line, sizeof(line), "/");
+    append_unsigned_decimal(
+        line,
+        sizeof(line),
+        (uint32_t)snapshot->display_capture_failures
+    );
+    desktop_settings_draw_hardware_line(content, palette, 234, line, false);
+
+    line[0] = '\0';
+    append_text(line, sizeof(line), "Warnings/failures: ");
+    append_unsigned_decimal(line, sizeof(line), snapshot->warning_count);
+    append_text(line, sizeof(line), "/");
+    append_unsigned_decimal(line, sizeof(line), snapshot->failure_count);
+    desktop_settings_draw_hardware_line(content, palette, 254, line, true);
+
+    desktop_settings_draw_hardware_line(
+        content,
+        palette,
+        280,
+        boot_mode_is_compatibility() ?
+            "Compatibility Mode: software graphics fallback is active" :
+            "Compatibility Mode is available from the Limine boot menu",
+        false
+    );
+
+    static const char *labels[3] = {
+        "Run test",
+        "Save report",
+        "Reset stats"
+    };
+
+    for (uint32_t index = 0U; index < 3U; index++)
+    {
+        ui_rect_t button =
+            desktop_settings_stability_action_button(content, index);
+        ui_control_draw_button(
+            &button,
+            labels[index],
+            palette,
+            stability_monitor_running() ?
+                UI_CONTROL_DISABLED : UI_CONTROL_NORMAL
+        );
+    }
+
+    desktop_settings_draw_hardware_line(
+        content,
+        palette,
+        360,
+        "Reports are saved to Documents/System Stability Report.txt",
+        false
+    );
+}
+
+static void desktop_settings_render_desktop(
+    const ui_rect_t *content,
+    const ui_palette_t *palette
+)
+{
+    char line[192];
+
+    desktop_settings_draw_hardware_line(
+        content,
+        palette,
+        60,
+        "Desktop reliability: READY",
+        true
+    );
+
+    desktop_settings_draw_hardware_line(
+        content,
+        palette,
+        82,
+        "Launcher first-frame protection: fresh opaque surface enforced",
+        false
+    );
+
+    line[0] = '\0';
+    append_text(line, sizeof(line), "Layout autosave: ");
+    append_text(
+        line,
+        sizeof(line),
+        layout_autosave_pending ? "waiting for movement to settle" : "idle"
+    );
+    desktop_settings_draw_hardware_line(content, palette, 104, line, false);
+
+    line[0] = '\0';
+    append_text(line, sizeof(line), "Fresh launches / animation recoveries: ");
+    append_unsigned_decimal(
+        line,
+        sizeof(line),
+        launcher_clean_launch_count
+    );
+    append_text(line, sizeof(line), " / ");
+    append_unsigned_decimal(
+        line,
+        sizeof(line),
+        animation_surface_recovery_count
+    );
+    desktop_settings_draw_hardware_line(content, palette, 130, line, false);
+
+    line[0] = '\0';
+    append_text(line, sizeof(line), "Autosaves / manual rebuilds: ");
+    append_unsigned_decimal(line, sizeof(line), layout_autosave_count);
+    append_text(line, sizeof(line), " / ");
+    append_unsigned_decimal(
+        line,
+        sizeof(line),
+        manual_surface_rebuild_count
+    );
+    desktop_settings_draw_hardware_line(content, palette, 150, line, false);
+
+    line[0] = '\0';
+    append_text(line, sizeof(line), "Surface captures/draws/scaled: ");
+    append_unsigned_decimal(
+        line,
+        sizeof(line),
+        window_surface_total_captures()
+    );
+    append_text(line, sizeof(line), "/");
+    append_unsigned_decimal(
+        line,
+        sizeof(line),
+        window_surface_total_draws()
+    );
+    append_text(line, sizeof(line), "/");
+    append_unsigned_decimal(
+        line,
+        sizeof(line),
+        window_surface_total_scaled_draws()
+    );
+    desktop_settings_draw_hardware_line(content, palette, 176, line, false);
+
+    line[0] = '\0';
+    append_text(line, sizeof(line), "Compositor FPS / dropped frames: ");
+    append_unsigned_decimal(
+        line,
+        sizeof(line),
+        compositor_recent_active_fps()
+    );
+    append_text(line, sizeof(line), " / ");
+    append_unsigned_decimal(
+        line,
+        sizeof(line),
+        compositor_dropped_frame_count()
+    );
+    desktop_settings_draw_hardware_line(content, palette, 196, line, false);
+
+    line[0] = '\0';
+    append_text(line, sizeof(line), "Display backend: ");
+    append_text(line, sizeof(line), compositor_display_backend());
+    append_text(line, sizeof(line), compositor_triple_buffered() ?
+        " (triple buffered)" : "");
+    desktop_settings_draw_hardware_line(content, palette, 216, line, false);
+
+    static const char *labels[4] = {
+        "Rebuild surfaces",
+        "Save layout",
+        "Reset positions",
+        "Save report"
+    };
+
+    for (uint32_t index = 0U; index < 4U; index++)
+    {
+        ui_rect_t button =
+            desktop_settings_desktop_action_button(content, index);
+        ui_control_draw_button(
+            &button,
+            labels[index],
+            palette,
+            UI_CONTROL_NORMAL
+        );
+    }
+
+    desktop_settings_draw_hardware_line(
+        content,
+        palette,
+        364,
+        "Report: Documents/Desktop Reliability Report.txt",
+        false
+    );
+}
+
 static void desktop_settings_render(const ui_rect_t *content)
 {
     if (content == NULL)
@@ -5237,6 +5866,14 @@ static void desktop_settings_render(const ui_rect_t *content)
             desktop_settings_render_hardware(content, &palette);
             break;
 
+        case SETTINGS_PAGE_STABILITY:
+            desktop_settings_render_stability(content, &palette);
+            break;
+
+        case SETTINGS_PAGE_DESKTOP:
+            desktop_settings_render_desktop(content, &palette);
+            break;
+
         case SETTINGS_PAGE_APPEARANCE:
         default:
             desktop_settings_render_appearance(content, &palette);
@@ -5255,7 +5892,7 @@ static bool desktop_settings_handle_click(
         return false;
     }
 
-    for (uint32_t index = 0; index < 3U; index++)
+    for (uint32_t index = 0; index < SETTINGS_PAGE_COUNT; index++)
     {
         ui_rect_t tab = desktop_settings_tab_button(content, index);
 
@@ -5320,6 +5957,101 @@ static bool desktop_settings_handle_click(
             }
 
             desktop_notify(hardware_compat_last_message(), 5000U);
+            return true;
+        }
+
+        return false;
+    }
+
+    if (settings_page == SETTINGS_PAGE_STABILITY)
+    {
+        if (stability_monitor_running())
+        {
+            return false;
+        }
+
+        for (uint32_t index = 0U; index < 3U; index++)
+        {
+            ui_rect_t button =
+                desktop_settings_stability_action_button(content, index);
+
+            if (!ui_point_in_rect(x, y, &button))
+            {
+                continue;
+            }
+
+            if (index == 0U)
+            {
+                (void)stability_monitor_start_test();
+            }
+            else if (index == 1U)
+            {
+                (void)stability_monitor_write_report();
+            }
+            else
+            {
+                stability_monitor_reset_statistics();
+            }
+
+            visible_stability_state = stability_monitor_state();
+            desktop_notify(stability_monitor_last_message(), 5000U);
+            invalidate_window(5);
+            return true;
+        }
+
+        return false;
+    }
+
+    if (settings_page == SETTINGS_PAGE_DESKTOP)
+    {
+        for (uint32_t index = 0U; index < 4U; index++)
+        {
+            ui_rect_t button =
+                desktop_settings_desktop_action_button(content, index);
+
+            if (!ui_point_in_rect(x, y, &button))
+            {
+                continue;
+            }
+
+            if (index == 0U)
+            {
+                window_animation_init();
+
+                for (
+                    uint32_t window_index = 0;
+                    window_index < GUI_WINDOW_COUNT;
+                    window_index++
+                )
+                {
+                    animation_target_valid[window_index] = false;
+                }
+
+                window_surface_invalidate_all();
+                drag_cache_valid = false;
+                manual_surface_rebuild_count++;
+                compositor_invalidate_all();
+                desktop_notify("All window surfaces rebuilt", 4000U);
+            }
+            else if (index == 1U)
+            {
+                save_window_layout();
+            }
+            else if (index == 2U)
+            {
+                reset_window_positions();
+            }
+            else
+            {
+                bool saved = write_desktop_reliability_report();
+                desktop_notify(
+                    saved ? "Desktop reliability report saved" :
+                        "Unable to save desktop reliability report",
+                    saved ? 4500U : 6500U
+                );
+            }
+
+            invalidate_window(5);
             return true;
         }
 
@@ -5497,7 +6229,32 @@ static bool render_animated_window(uint8_t index)
         visual_effects_draw_shadow(&bounds, COLOR_SHADOW);
     }
 
-    return window_surface_draw_scaled(index, &bounds);
+    if (window_surface_draw_scaled(index, &bounds))
+    {
+        return true;
+    }
+
+    animation_surface_recovery_count++;
+    window_animation_cancel(index);
+
+    if (animation_target_valid[index])
+    {
+        windows[index].state = animation_targets[index];
+        animation_target_valid[index] = false;
+
+        if (
+            windows[index].state.visible &&
+            !windows[index].state.minimized
+        )
+        {
+            bring_window_to_front(index);
+        }
+    }
+
+    window_surface_invalidate(index);
+    render_window(index, &windows[index]);
+    compositor_invalidate_all();
+    return true;
 }
 
 static void render_cached_drag_window(
@@ -5804,7 +6561,15 @@ static bool handle_popup_click(int32_t x, int32_t y)
         {
             if (command < GUI_WINDOW_COUNT)
             {
-                activate_window((uint8_t)command);
+                uint8_t window_index = (uint8_t)command;
+                force_fresh_activation = true;
+                window_animation_cancel(window_index);
+                animation_target_valid[window_index] = false;
+                window_surface_invalidate(window_index);
+                launcher_clean_launch_count++;
+                activate_window(window_index);
+                force_fresh_activation = false;
+                compositor_invalidate_all();
             }
             else if (
                 command >= LAUNCHER_RECENT_COMMAND_BASE &&
@@ -7740,6 +8505,9 @@ static void start_gui(void)
         }
     }
 
+    refresh_layout_observer();
+    layout_autosave_pending = false;
+
     window_order[0] = 2;
     window_order[1] = 3;
     window_order[2] = 4;
@@ -7829,6 +8597,14 @@ static void start_gui(void)
         first_boot_notification_pending = false;
     }
 
+    if (boot_health_previous_incomplete())
+    {
+        desktop_notify(
+            "Previous boot did not reach the desktop; Compatibility Mode is available",
+            8000U
+        );
+    }
+
     if (boot_mode_is_safe())
     {
         desktop_notify(
@@ -7858,6 +8634,29 @@ static void start_gui(void)
         );
     }
 
+    if (boot_mode_is_compatibility())
+    {
+        settings_page = SETTINGS_PAGE_STABILITY;
+        activate_window(5);
+        (void)stability_monitor_start_test();
+        visible_stability_state = stability_monitor_state();
+        desktop_notify(
+            "Compatibility Mode: software graphics and stability testing active",
+            7500U
+        );
+    }
+
+    if (boot_mode_is_virtualbox())
+    {
+        settings_page = SETTINGS_PAGE_HARDWARE;
+        activate_window(5);
+        desktop_notify(
+            "VirtualBox Mode: EFI framebuffer, PS/2 input, and AHCI profile active",
+            8000U
+        );
+    }
+
+    boot_health_mark_desktop_ready();
     visible_notification_count = desktop_notification_count();
     compositor_invalidate_all();
 }
@@ -7868,10 +8667,21 @@ void gui_init(void)
     app_suite_init();
     (void)user_home_ensure();
     release_info_init();
+    boot_health_init();
     hardware_compat_init();
+    stability_monitor_init();
     package_manager_init();
     first_boot_notification_pending =
         boot_mode_prepare_first_boot();
+    visible_stability_state = stability_monitor_state();
+    layout_observer_ready = false;
+    layout_autosave_pending = false;
+    layout_autosave_deadline = 0ULL;
+    layout_autosave_count = 0ULL;
+    launcher_clean_launch_count = 0ULL;
+    animation_surface_recovery_count = 0ULL;
+    manual_surface_rebuild_count = 0ULL;
+    force_fresh_activation = false;
     desktop_services_init();
     desktop_editor_init();
     installer_init();
@@ -8024,6 +8834,30 @@ void gui_update(void)
     display_update();
     update_installer_background();
 
+    bool stability_changed = stability_monitor_update();
+    stability_state_t stability_state = stability_monitor_state();
+
+    if (stability_state != visible_stability_state)
+    {
+        visible_stability_state = stability_state;
+
+        if (
+            stability_state == STABILITY_STATE_PASSED ||
+            stability_state == STABILITY_STATE_WARNING ||
+            stability_state == STABILITY_STATE_FAILED
+        )
+        {
+            desktop_notify(stability_monitor_last_message(), 6000U);
+        }
+
+        stability_changed = true;
+    }
+
+    if (stability_changed && settings_page == SETTINGS_PAGE_STABILITY)
+    {
+        invalidate_window(5);
+    }
+
     bool render_frame = frame_is_due();
 
     update_clock(false);
@@ -8039,6 +8873,7 @@ void gui_update(void)
     update_window_animations();
     update_mouse_events();
     process_events();
+    update_layout_autosave();
 
     if (!active)
     {

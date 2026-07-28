@@ -15,8 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 ARCHITECTURE = "x86_64"
-MILESTONE = "20A"
-CHANNEL = "alpha"
+MILESTONE = "20D"
+CHANNEL = "rc"
 
 
 def sha256(path: Path) -> str:
@@ -184,6 +184,8 @@ def main() -> None:
     parser.add_argument("--package", type=Path, default=Path("dist/packages/hello-1.0.0.lpkg"))
     parser.add_argument("--recovery-config", type=Path, default=Path("limine-recovery.conf"))
     parser.add_argument("--limine-directory", type=Path, default=Path("limine-binary"))
+    parser.add_argument("--virtualbox-builder", type=Path, default=Path("make-virtualbox.py"))
+    parser.add_argument("--virtualbox-readme", type=Path, default=Path("VIRTUALBOX.txt"))
     parser.add_argument("--output", type=Path, default=Path("dist"))
     args = parser.parse_args()
 
@@ -198,6 +200,8 @@ def main() -> None:
             (args.kernel, "kernel"),
             (args.package, "demo package"),
             (args.recovery_config, "recovery configuration"),
+            (args.virtualbox_builder, "VirtualBox builder"),
+            (args.virtualbox_readme, "VirtualBox guide"),
         ):
             require_file(path, description)
 
@@ -210,10 +214,14 @@ def main() -> None:
         installed_image = release_directory / f"{release_name}-installed.img"
         recovery_iso = release_directory / f"{release_name}-recovery.iso"
         demo_package = release_directory / args.package.name
+        virtualbox_builder = release_directory / args.virtualbox_builder.name
+        virtualbox_readme = release_directory / args.virtualbox_readme.name
 
         copy_artifact(args.iso, normal_iso)
         copy_artifact(args.installed, installed_image)
         copy_artifact(args.package, demo_package)
+        copy_artifact(args.virtualbox_builder, virtualbox_builder)
+        copy_artifact(args.virtualbox_readme, virtualbox_readme)
         build_recovery_iso(
             recovery_iso,
             args.kernel,
@@ -222,7 +230,14 @@ def main() -> None:
             timestamp,
         )
 
-        artifacts = [normal_iso, installed_image, recovery_iso, demo_package]
+        artifacts = [
+            normal_iso,
+            installed_image,
+            recovery_iso,
+            demo_package,
+            virtualbox_builder,
+            virtualbox_readme,
+        ]
         manifest_files = []
         for artifact in artifacts:
             manifest_files.append({
@@ -254,11 +269,12 @@ def main() -> None:
             f"LatterOS {version}\n"
             f"Milestone {MILESTONE} ({CHANNEL})\n\n"
             "Artifacts:\n"
-            "- Bootable installer ISO with normal, Safe Mode, Recovery, and Hardware Test entries\n"
+            "- Bootable installer ISO with normal, Safe Mode, Recovery, Hardware Test, Compatibility, and VirtualBox entries\n"
             "- Installed UEFI disk image\n"
             "- Recovery-first ISO\n"
-            "- LPKG v1 demo application package\n\n"
-            "The release begins hardware compatibility and stabilization testing.\n",
+            "- LPKG v1 demo application package\n"
+            "- Oracle VirtualBox VM builder and supported-profile guide\n\n"
+            "This release candidate adds VirtualBox EFI/AHCI/VMSVGA/PS2 profiles, hypervisor detection, and persistent boot-health reporting.\n",
             encoding="utf-8",
             newline="\n",
         )

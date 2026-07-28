@@ -2,6 +2,7 @@
 
 #include "boot_mode.h"
 #include "graphics.h"
+#include "platform_detect.h"
 #include "surface.h"
 #include "timer.h"
 #include "virtio_gpu.h"
@@ -305,9 +306,12 @@ void display_init(void)
         initialize_slot(index);
     }
 
+    platform_detect_init();
+
     if (
         buffering_available &&
         !boot_mode_conservative_graphics() &&
+        !platform_is_virtualbox() &&
         virtio_gpu_init(active_width, active_height)
     )
     {
@@ -604,6 +608,13 @@ const char *display_backend_name(void)
 
         case DISPLAY_BACKEND_SOFTWARE_FRAMEBUFFER:
         default:
+            if (platform_is_virtualbox())
+            {
+                return buffering_available ?
+                    "virtualbox-efi-scanout" :
+                    "virtualbox-efi-framebuffer";
+            }
+
             return buffering_available ?
                 "software-scanout" :
                 "direct-framebuffer";

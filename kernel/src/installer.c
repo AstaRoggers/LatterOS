@@ -158,19 +158,39 @@ static const char installed_limine_configuration[] =
     "    module_string: latteros-installer-kernel\n"
     "    module_path: boot():/EFI/BOOT/BOOTX64.EFI\n"
     "    module_string: latteros-installer-bootx64\n"
+    "    resolution: 1280x800x32\n"
+    "\n"
+    "/LatterOS Compatibility Mode\n"
+    "    protocol: limine\n"
+    "    path: boot():/boot/kernel\n"
+    "    cmdline: source=installed mode=compatibility\n"
+    "    module_path: boot():/boot/kernel\n"
+    "    module_string: latteros-installer-kernel\n"
+    "    module_path: boot():/EFI/BOOT/BOOTX64.EFI\n"
+    "    module_string: latteros-installer-bootx64\n"
+    "    resolution: 1280x800x32\n"
+    "\n"
+    "/LatterOS VirtualBox Mode\n"
+    "    protocol: limine\n"
+    "    path: boot():/boot/kernel\n"
+    "    cmdline: source=installed mode=virtualbox\n"
+    "    module_path: boot():/boot/kernel\n"
+    "    module_string: latteros-installer-kernel\n"
+    "    module_path: boot():/EFI/BOOT/BOOTX64.EFI\n"
+    "    module_string: latteros-installer-bootx64\n"
     "    resolution: 1280x800x32\n";
 
 static const char installation_marker[] =
-    "LatterOS 0.20.0-alpha installation complete.\r\n"
+    "LatterOS 0.20.3-rc1 installation complete.\r\n"
     "UEFI fallback loader: /EFI/BOOT/BOOTX64.EFI\r\n"
     "Kernel: /boot/kernel\r\n"
     "Configuration: /boot/limine/limine.conf\r\n";
 
 static const char installation_version[] =
     "name=LatterOS\r\n"
-    "version=0.20.0-alpha\r\n"
-    "milestone=20A\r\n"
-    "channel=alpha\r\n"
+    "version=0.20.3-rc1\r\n"
+    "milestone=20D\r\n"
+    "channel=rc\r\n"
     "boot=Limine UEFI\r\n"
     "architecture=x86_64\r\n"
     "package-format=LPKGv1\r\n";
@@ -1323,7 +1343,7 @@ static bool write_gpt(
 
     static const char marker[] =
         "LatterOS installation volume.\r\n"
-        "Milestone 20A installs hardware-test and recovery boot payloads.\r\n";
+        "Milestone 20D installs VirtualBox-ready release-candidate boot payloads.\r\n";
 
     uint64_t efi_sectors = efi_last - efi_first + 1ULL;
     uint64_t system_sectors = system_last - system_first + 1ULL;

@@ -22,10 +22,14 @@ IMAGE_NAME := template-x86_64.iso
 OVMF_DIRECTORY := edk2-ovmf-bins
 OVMF_CODE := $(OVMF_DIRECTORY)/ovmf-code-x86_64.fd
 PYTHON ?= python
+VIRTUALBOX_BUILDER := make-virtualbox.py
+VIRTUALBOX_VM_NAME := LatterOS 0.20.3 RC1
+VIRTUALBOX_DIRECTORY := dist/virtualbox
 
 .PHONY: run rebuild usb-image sata-image nvme-image install-target \
 	reset-install-target verify-installed run-installed package-demo \
-	verify-package release release-clean run-recovery
+	verify-package release release-clean run-recovery \
+	virtualbox-installer virtualbox-installed virtualbox-status virtualbox-clean
 
 $(DISK_IMAGE):
 	dd if=/dev/zero of=$(DISK_IMAGE) bs=1M count=16
@@ -71,6 +75,29 @@ reset-install-target:
 
 verify-installed: $(INSTALL_TARGET_IMAGE) $(INSTALL_TARGET_VERIFIER)
 	$(PYTHON) $(INSTALL_TARGET_VERIFIER) $(INSTALL_TARGET_IMAGE)
+
+virtualbox-installer: $(VIRTUALBOX_BUILDER)
+	$(MAKE) -f GNUmakefile TOOLCHAIN=llvm CFLAGS="-g -O2 -pipe -fno-omit-frame-pointer"
+	$(PYTHON) $(VIRTUALBOX_BUILDER) installer \
+		--iso $(IMAGE_NAME) \
+		--directory $(VIRTUALBOX_DIRECTORY) \
+		--name "$(VIRTUALBOX_VM_NAME)" \
+		--replace --start
+
+virtualbox-installed: verify-installed $(VIRTUALBOX_BUILDER)
+	$(PYTHON) $(VIRTUALBOX_BUILDER) installed \
+		--image $(INSTALL_TARGET_IMAGE) \
+		--directory $(VIRTUALBOX_DIRECTORY) \
+		--name "$(VIRTUALBOX_VM_NAME)" \
+		--replace --start
+
+virtualbox-status: $(VIRTUALBOX_BUILDER)
+	$(PYTHON) $(VIRTUALBOX_BUILDER) status --name "$(VIRTUALBOX_VM_NAME)"
+
+virtualbox-clean: $(VIRTUALBOX_BUILDER)
+	$(PYTHON) $(VIRTUALBOX_BUILDER) clean \
+		--directory $(VIRTUALBOX_DIRECTORY) \
+		--name "$(VIRTUALBOX_VM_NAME)"
 
 run: $(DISK_IMAGE) $(USB_DISK_IMAGE) $(SATA_DISK_IMAGE) $(NVME_DISK_IMAGE) $(INSTALL_TARGET_IMAGE)
 	$(MAKE) -f GNUmakefile TOOLCHAIN=llvm CFLAGS="-g -O2 -pipe -fno-omit-frame-pointer"

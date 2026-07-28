@@ -77,13 +77,12 @@ bool release_info_write_files(void)
         "LatterOS " LATTEROS_RELEASE_VERSION "\n"
         "Milestone " LATTEROS_RELEASE_MILESTONE "\n"
         "\n"
-        "This release begins hardware compatibility and stabilization work.\n"
-        "It adds a non-destructive compatibility dashboard, CPU feature\n"
-        "inventory, ACPI/PCI/storage/USB/network reporting, a saved hardware\n"
-        "report, and a conservative Hardware Test boot entry.\n"
-        "\n"
-        "Open Settings > Hardware to refresh the profile, run the quick\n"
-        "compatibility test, and save the full report in Documents.\n";
+        "This release candidate adds first-class Oracle VirtualBox support.\n"
+        "The host tooling creates EFI, ICH9, Intel AHCI, VMSVGA, PS/2, and\n"
+        "1280x800 VM profiles for both the installer ISO and installed image.\n"
+        "LatterOS now detects common hypervisors, uses a VirtualBox EFI\n"
+        "framebuffer fallback, provides a VirtualBox boot profile, and records\n"
+        "boot attempts that fail before the desktop becomes ready.\n";
 
     return
         vfs_write_text(RELEASE_METADATA_PATH, metadata) &&

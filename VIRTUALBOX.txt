@@ -1,0 +1,35 @@
+LatterOS 0.20.3 RC1 - Oracle VirtualBox
+========================================
+
+Supported profile
+-----------------
+Firmware: EFI
+Chipset: ICH9
+Storage: Intel AHCI
+Graphics: VMSVGA, 3D disabled
+Display path: EFI framebuffer at 1280x800
+Input: PS/2 keyboard and mouse
+Memory: 2048 MiB
+Processors: 4 with I/O APIC
+Network: disabled until Milestone 21A
+
+Run the installer ISO
+---------------------
+make -f storage-run.mk virtualbox-installer
+
+Run the current installed image
+-------------------------------
+make -f storage-run.mk virtualbox-installed
+
+Inspect or remove the VM
+------------------------
+make -f storage-run.mk virtualbox-status
+make -f storage-run.mk virtualbox-clean
+
+The helper recreates a VM named "LatterOS 0.20.3 RC1". Override the
+VBoxManage location with the VBOXMANAGE environment variable when it is not
+on PATH.
+
+Normal boot should work. The Limine menu also contains "LatterOS VirtualBox
+Mode", which forces conservative EFI-framebuffer rendering and opens the
+hardware dashboard.

@@ -3,7 +3,7 @@ BdsDxe: starting Boot0002 "UEFI QEMU HARDDISK QM00005 " from PciRoot(0x0)/Pci(0x
 [001;001H[001;001H[000001] INFO boot: LatterOS starting; framebuffer=1280x800 pitch=5120 serial=ready
 [000002] INFO cpu: GDT and IDT initialized
 [000003] INFO acpi: tables=ready root=XSDT cpus=4 ioapics=1
-[000004] INFO memory: usable=1972852 KiB pages=493213 free=262143
+[000004] INFO memory: usable=1972524 KiB pages=493131 free=262143
 [000005] INFO process: Process scheduler initialized
 [000006] INFO pci: devices=7 storage=detected ahci-disks=1
 [000007] WARN filesystem: Persistent /home unavailable; using RAM fallback

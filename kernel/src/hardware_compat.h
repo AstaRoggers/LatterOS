@@ -32,6 +32,11 @@ typedef struct
     bool invariant_tsc;
     bool sse2;
 
+    bool hypervisor_present;
+    bool virtualbox;
+    char hypervisor_name[32];
+    char hypervisor_vendor[16];
+
     uint32_t detected_cpus;
     uint32_t online_cpus;
     uint64_t total_memory_bytes;

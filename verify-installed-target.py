@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify a LatterOS Milestone 20A installation target."""
+"""Verify a LatterOS Milestone 20D installation target."""
 
 from __future__ import annotations
 
@@ -289,11 +289,15 @@ def verify_image(path: Path) -> None:
         require("source=installed mode=safe" in config_text, "safe-mode command line is missing")
         require("source=installed mode=recovery" in config_text, "recovery command line is missing")
         require("/LatterOS Hardware Test" in config_text, "installed config has no hardware-test entry")
+        require("/LatterOS Compatibility Mode" in config_text, "installed config has no compatibility entry")
+        require("mode=compatibility" in config_text, "installed config has no compatibility command line")
+        require("/LatterOS VirtualBox Mode" in config_text, "installed config has no VirtualBox entry")
+        require("source=installed mode=virtualbox" in config_text, "VirtualBox command line is missing")
         require("source=installed mode=hardware" in config_text, "hardware-test command line is missing")
         require(b"installation complete" in esp_marker.lower(), "EFI installation marker is incomplete")
         require(b"installation complete" in system_marker.lower(), "system installation marker is incomplete")
-        require(b"milestone=20A" in version, "system version file is not Milestone 20A")
-        require(b"version=0.20.0-alpha" in version, "system release version is missing")
+        require(b"milestone=20D" in version, "system version file is not Milestone 20D")
+        require(b"version=0.20.3-rc1" in version, "system release version is missing")
         require(b"package-format=LPKGv1" in version, "LPKG package format metadata is missing")
 
         print(f"PASS protective MBR and GPT ({len(partitions)} partitions)")
@@ -303,7 +307,7 @@ def verify_image(path: Path) -> None:
         print("PASS Limine configuration in EFI/BOOT and boot/limine")
         print(f"PASS system FAT32: {partitions[1].name or 'unnamed'} ({partitions[1].sector_count * SECTOR_SIZE // 1024 // 1024} MiB)")
         print("PASS mirrored system kernel, installation marker, and version metadata")
-        print("LatterOS Milestone 20A installation target verified")
+        print("LatterOS Milestone 20D installation target verified")
 
 
 def main() -> None:

@@ -63,6 +63,14 @@ static void parse_token(const char *token, size_t length)
     {
         selected_mode = BOOT_MODE_HARDWARE_TEST;
     }
+    else if (token_equal(token, length, "mode=compatibility"))
+    {
+        selected_mode = BOOT_MODE_COMPATIBILITY;
+    }
+    else if (token_equal(token, length, "mode=virtualbox"))
+    {
+        selected_mode = BOOT_MODE_VIRTUALBOX;
+    }
     else if (token_equal(token, length, "mode=normal"))
     {
         selected_mode = BOOT_MODE_NORMAL;
@@ -74,6 +82,10 @@ static void parse_token(const char *token, size_t length)
     else if (token_equal(token, length, "source=installed"))
     {
         selected_source = BOOT_SOURCE_INSTALLED;
+    }
+    else if (token_equal(token, length, "source=recovery-media"))
+    {
+        selected_source = BOOT_SOURCE_RECOVERY_MEDIA;
     }
 }
 
@@ -155,6 +167,16 @@ bool boot_mode_is_hardware_test(void)
     return boot_mode_kind() == BOOT_MODE_HARDWARE_TEST;
 }
 
+bool boot_mode_is_compatibility(void)
+{
+    return boot_mode_kind() == BOOT_MODE_COMPATIBILITY;
+}
+
+bool boot_mode_is_virtualbox(void)
+{
+    return boot_mode_kind() == BOOT_MODE_VIRTUALBOX;
+}
+
 bool boot_mode_is_installed(void)
 {
     return boot_mode_source() == BOOT_SOURCE_INSTALLED;
@@ -166,7 +188,9 @@ bool boot_mode_conservative_graphics(void)
     return
         mode == BOOT_MODE_SAFE ||
         mode == BOOT_MODE_RECOVERY ||
-        mode == BOOT_MODE_HARDWARE_TEST;
+        mode == BOOT_MODE_HARDWARE_TEST ||
+        mode == BOOT_MODE_COMPATIBILITY ||
+        mode == BOOT_MODE_VIRTUALBOX;
 }
 
 const char *boot_mode_name(void)
@@ -181,6 +205,12 @@ const char *boot_mode_name(void)
 
         case BOOT_MODE_HARDWARE_TEST:
             return "Hardware Test";
+
+        case BOOT_MODE_COMPATIBILITY:
+            return "Compatibility Mode";
+
+        case BOOT_MODE_VIRTUALBOX:
+            return "VirtualBox Mode";
 
         case BOOT_MODE_NORMAL:
         default:
@@ -197,6 +227,9 @@ const char *boot_source_name(void)
 
         case BOOT_SOURCE_INSTALLED:
             return "Installed system";
+
+        case BOOT_SOURCE_RECOVERY_MEDIA:
+            return "Recovery media";
 
         case BOOT_SOURCE_UNKNOWN:
         default:
@@ -228,7 +261,7 @@ bool boot_mode_prepare_first_boot(void)
     first_boot_detected = vfs_write_text(
         FIRST_BOOT_MARKER,
         "LatterOS installed-system first boot completed.\n"
-        "milestone=20A\n"
+        "milestone=20D\n"
     );
 
     if (first_boot_detected && vfs_open(FIRST_BOOT_GUIDE) == NULL)
@@ -240,6 +273,7 @@ bool boot_mode_prepare_first_boot(void)
             "Use System > Recovery tools for disk checks and recovery actions.\n"
             "At boot, choose Safe Mode for conservative software graphics.\n"
             "Choose Hardware Test to open the compatibility dashboard.\n"
+            "Choose Compatibility Mode for conservative software graphics and stability testing.\n"
         );
     }
 

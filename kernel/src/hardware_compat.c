@@ -8,6 +8,7 @@
 #include "nvme.h"
 #include "pci.h"
 #include "physical_memory.h"
+#include "platform_detect.h"
 #include "smp.h"
 #include "usb.h"
 #include "vfs.h"
@@ -389,6 +390,22 @@ static void collect_pci(hardware_compat_snapshot_t *snapshot)
             continue;
         }
 
+        if (device->vendor_id == 0x80EEU)
+        {
+            snapshot->hypervisor_present = true;
+            snapshot->virtualbox = true;
+            copy_text(
+                snapshot->hypervisor_name,
+                sizeof(snapshot->hypervisor_name),
+                "Oracle VirtualBox"
+            );
+            copy_text(
+                snapshot->hypervisor_vendor,
+                sizeof(snapshot->hypervisor_vendor),
+                "PCI 80EE"
+            );
+        }
+
         switch (device->class_code)
         {
             case 0x01U:
@@ -540,6 +557,20 @@ void hardware_compat_refresh(void)
 
     collect_cpu(&current_snapshot);
 
+    platform_detect_init();
+    current_snapshot.hypervisor_present = platform_hypervisor_present();
+    current_snapshot.virtualbox = platform_is_virtualbox();
+    copy_text(
+        current_snapshot.hypervisor_name,
+        sizeof(current_snapshot.hypervisor_name),
+        platform_hypervisor_name()
+    );
+    copy_text(
+        current_snapshot.hypervisor_vendor,
+        sizeof(current_snapshot.hypervisor_vendor),
+        platform_hypervisor_vendor()
+    );
+
     current_snapshot.detected_cpus = smp_cpu_count();
     current_snapshot.online_cpus = smp_online_count();
     current_snapshot.total_memory_bytes = physical_memory_total_bytes();
@@ -667,7 +698,7 @@ bool hardware_compat_run_quick_test(void)
 static void append_report_header(size_t *position)
 {
     append_text(report_buffer, sizeof(report_buffer), position, "LatterOS Hardware Compatibility Report\n");
-    append_text(report_buffer, sizeof(report_buffer), position, "Milestone 20A\n\n");
+    append_text(report_buffer, sizeof(report_buffer), position, "Milestone 20D\n\n");
     append_text(report_buffer, sizeof(report_buffer), position, "Status: ");
     append_text(report_buffer, sizeof(report_buffer), position, hardware_compat_status_name());
     append_text(report_buffer, sizeof(report_buffer), position, "\nSummary: ");
@@ -714,7 +745,13 @@ static void append_report_cpu(size_t *position)
 
 static void append_report_platform(size_t *position)
 {
-    append_text(report_buffer, sizeof(report_buffer), position, "Platform\n--------\nTotal memory MiB: ");
+    append_text(report_buffer, sizeof(report_buffer), position, "Platform\n--------\nHypervisor: ");
+    append_text(report_buffer, sizeof(report_buffer), position, current_snapshot.hypervisor_name);
+    append_text(report_buffer, sizeof(report_buffer), position, "\nHypervisor vendor: ");
+    append_text(report_buffer, sizeof(report_buffer), position, current_snapshot.hypervisor_vendor);
+    append_text(report_buffer, sizeof(report_buffer), position, "\nVirtualBox profile: ");
+    append_boolean(report_buffer, sizeof(report_buffer), position, current_snapshot.virtualbox);
+    append_text(report_buffer, sizeof(report_buffer), position, "\nTotal memory MiB: ");
     append_unsigned(report_buffer, sizeof(report_buffer), position, current_snapshot.total_memory_bytes / (1024ULL * 1024ULL));
     append_text(report_buffer, sizeof(report_buffer), position, "\nUsable memory MiB: ");
     append_unsigned(report_buffer, sizeof(report_buffer), position, current_snapshot.usable_memory_bytes / (1024ULL * 1024ULL));
