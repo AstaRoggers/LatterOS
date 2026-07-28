@@ -1,6 +1,7 @@
 #include "gui.h"
 
 #include "app_suite.h"
+#include "boot_mode.h"
 #include "compositor.h"
 #include "desktop_dialog.h"
 #include "desktop_editor.h"
@@ -8,10 +9,15 @@
 #include "desktop_services.h"
 #include "display.h"
 #include "graphics.h"
+#include "hardware_compat.h"
+#include "installer.h"
 #include "keyboard.h"
 #include "mouse.h"
+#include "package_manager.h"
 #include "power.h"
 #include "process.h"
+#include "recovery.h"
+#include "release_info.h"
 #include "rtc.h"
 #include "security.h"
 #include "shell.h"
@@ -19,16 +25,20 @@
 #include "timer.h"
 #include "ui.h"
 #include "ui_controls.h"
+#include "user_home.h"
 #include "vfs.h"
 #include "virtio_gpu.h"
+#include "visual_effects.h"
+#include "window_animation.h"
 #include "window_manager.h"
+#include "window_surface.h"
 
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
 #define GUI_EVENT_QUEUE_SIZE 96U
-#define GUI_WINDOW_COUNT 7U
+#define GUI_WINDOW_COUNT 8U
 #define GUI_CURSOR_SIZE 16
 #define GUI_TARGET_FRAME_RATE 60U
 #define GUI_POINTER_FIXED_SHIFT 8
@@ -43,7 +53,7 @@
 #define TASKBAR_HEIGHT 36U
 #define WINDOW_RESIZE_BORDER 7U
 #define WINDOW_SNAP_THRESHOLD 18U
-#define WINDOW_SHADOW_SIZE 5U
+#define WINDOW_SHADOW_SIZE 10U
 
 #define TERMINAL_HISTORY_LINES 128U
 #define TERMINAL_COLUMNS 96U
@@ -60,7 +70,7 @@
 #define LAUNCHER_MENU_WIDTH 210U
 #define SYSTEM_MENU_WIDTH 210U
 #define CONTEXT_MENU_WIDTH 190U
-#define DESKTOP_ICON_COUNT 6U
+#define DESKTOP_ICON_COUNT 7U
 #define DESKTOP_ICON_WIDTH 92U
 #define DESKTOP_ICON_HEIGHT 70U
 #define DESKTOP_ICON_GAP 12U
@@ -74,6 +84,8 @@
 #define NOTIFICATION_HEIGHT 52U
 #define NOTIFICATION_GAP 8U
 #define FILE_DRAG_THRESHOLD 8
+#define INSTALLER_VISIBLE_ROWS 6U
+#define INSTALLER_STATUS_CAPACITY 160U
 
 #define COLOR_TERMINAL 0x101820U
 #define COLOR_TERMINAL_TEXT 0xD6F5D6U
@@ -129,7 +141,8 @@ typedef enum
     GUI_APP_CALCULATOR,
     GUI_APP_PAINT,
     GUI_APP_SETTINGS,
-    GUI_APP_PROCESS_MANAGER
+    GUI_APP_PROCESS_MANAGER,
+    GUI_APP_INSTALLER
 } gui_app_type_t;
 
 typedef struct
@@ -147,7 +160,11 @@ typedef enum
     PENDING_ACTION_NEW_FOLDER,
     PENDING_ACTION_RENAME,
     PENDING_ACTION_DELETE,
-    PENDING_ACTION_COLOR
+    PENDING_ACTION_COLOR,
+    PENDING_ACTION_EDITOR_SAVE_AS,
+    PENDING_ACTION_INSTALL_PREPARE,
+    PENDING_ACTION_PACKAGE_INSTALL,
+    PENDING_ACTION_PACKAGE_REMOVE
 } pending_action_t;
 
 typedef enum
@@ -175,6 +192,8 @@ typedef enum
     SYSTEM_COMMAND_RELOAD_THEME,
     SYSTEM_COMMAND_SAVE_LAYOUT,
     SYSTEM_COMMAND_CLEAR_NOTIFICATIONS,
+    SYSTEM_COMMAND_INSTALLER,
+    SYSTEM_COMMAND_RECOVERY,
     SYSTEM_COMMAND_ABOUT,
     SYSTEM_COMMAND_RESTART,
     SYSTEM_COMMAND_SHUTDOWN
@@ -190,6 +209,8 @@ static volatile uint32_t event_write_index;
 
 static gui_window_t windows[GUI_WINDOW_COUNT];
 static uint8_t window_order[GUI_WINDOW_COUNT];
+static wm_window_state_t animation_targets[GUI_WINDOW_COUNT];
+static bool animation_target_valid[GUI_WINDOW_COUNT];
 
 static char terminal_lines[
     TERMINAL_HISTORY_LINES
@@ -260,6 +281,21 @@ static char clock_text[6];
 static uint64_t last_clock_update;
 static uint32_t chrome_accent;
 static uint32_t visible_notification_count;
+static uint32_t installer_selected_target;
+static char installer_status[INSTALLER_STATUS_CAPACITY];
+static installer_report_t installer_report;
+static uint32_t installer_visible_progress;
+static bool recovery_panel_active;
+typedef enum
+{
+    SETTINGS_PAGE_APPEARANCE,
+    SETTINGS_PAGE_PACKAGES,
+    SETTINGS_PAGE_HARDWARE
+} settings_page_t;
+
+static settings_page_t settings_page;
+static bool animations_enabled;
+static bool first_boot_notification_pending;
 
 typedef struct
 {
@@ -274,7 +310,8 @@ static const desktop_icon_t desktop_icons[DESKTOP_ICON_COUNT] = {
     { "Editor", GUI_APP_TEXT_EDITOR, 0x3B8CC4U },
     { "Paint", GUI_APP_PAINT, 0xC95D68U },
     { "Settings", GUI_APP_SETTINGS, 0x7C8794U },
-    { "Tasks", GUI_APP_PROCESS_MANAGER, 0x48A06AU }
+    { "Tasks", GUI_APP_PROCESS_MANAGER, 0x48A06AU },
+    { "Install", GUI_APP_INSTALLER, 0xB56B2DU }
 };
 
 static const ui_menu_item_t system_items[] = {
@@ -286,6 +323,8 @@ static const ui_menu_item_t system_items[] = {
     { "Reload external theme", true, false, false, SYSTEM_COMMAND_RELOAD_THEME },
     { "Save window layout", true, false, false, SYSTEM_COMMAND_SAVE_LAYOUT },
     { "Clear notifications", true, false, false, SYSTEM_COMMAND_CLEAR_NOTIFICATIONS },
+    { "Install LatterOS", true, false, false, SYSTEM_COMMAND_INSTALLER },
+    { "Recovery tools", true, false, false, SYSTEM_COMMAND_RECOVERY },
     { "About LatterOS", true, false, false, SYSTEM_COMMAND_ABOUT },
     { NULL, false, false, true, 0 },
     { "Restart", true, false, false, SYSTEM_COMMAND_RESTART },
@@ -320,7 +359,19 @@ static void build_node_path(
 );
 static void save_window_layout(void);
 static void rebuild_launcher_items(void);
+static void show_editor_save_as_dialog(void);
+static void show_installer_confirmation(void);
+static void show_package_install_dialog(const char *path);
+static void show_package_remove_dialog(const char *name);
 static void open_associated_node(vfs_node_t *node);
+static void update_window_animations(void);
+static bool begin_window_state_animation(
+    uint8_t index,
+    window_animation_type_t type,
+    const wm_window_state_t *target,
+    const ui_rect_t *visual_target,
+    uint32_t duration_ms
+);
 
 static size_t string_length(const char *text)
 {
@@ -407,6 +458,34 @@ static void append_text(
     }
 
     destination[position] = '\0';
+}
+
+static void append_unsigned_decimal(
+    char *destination,
+    size_t capacity,
+    uint64_t value
+)
+{
+    char reverse[24];
+    uint32_t count = 0;
+
+    if (value == 0)
+    {
+        append_text(destination, capacity, "0");
+        return;
+    }
+
+    while (value != 0 && count < sizeof(reverse))
+    {
+        reverse[count++] = (char)('0' + value % 10ULL);
+        value /= 10ULL;
+    }
+
+    while (count != 0)
+    {
+        char text[2] = { reverse[--count], '\0' };
+        append_text(destination, capacity, text);
+    }
 }
 
 static int32_t absolute_value(int32_t value)
@@ -996,8 +1075,14 @@ static const char *app_label(uint8_t index)
         "Calc",
         "Paint",
         "Settings",
-        "Tasks"
+        "Tasks",
+        "Installer"
     };
+
+    if (index == 7U && recovery_panel_active)
+    {
+        return "Recovery";
+    }
 
     return index < GUI_WINDOW_COUNT ?
         labels[index] : "App";
@@ -1462,6 +1547,8 @@ static void invalidate_window(uint8_t index)
         return;
     }
 
+    window_surface_invalidate(index);
+
     ui_rect_t rectangle =
         window_visual_bounds(&windows[index]);
 
@@ -1545,10 +1632,173 @@ static uint8_t active_fullscreen_window(void)
 
 static void close_popup_menu(void)
 {
+    bool was_visible = popup_menu.visible;
+    ui_rect_t old_bounds = popup_menu.bounds;
+
     ui_menu_close(&popup_menu);
     popup_is_launcher = false;
     popup_is_system = false;
     popup_is_desktop = false;
+
+    /*
+     * Popup menus are composed after the desktop and windows. Closing one
+     * must damage its previous screen area even when the selected command
+     * immediately starts a window animation. Without this invalidation the
+     * old launcher pixels remain in the scanout until another full redraw.
+     */
+    if (was_visible)
+    {
+        compositor_invalidate(&old_bounds);
+    }
+}
+
+static ui_rect_t animation_visual_bounds(
+    const ui_rect_t *bounds
+)
+{
+    if (bounds == NULL)
+    {
+        return (ui_rect_t){ 0, 0, 0, 0 };
+    }
+
+    ui_rect_t result = *bounds;
+    result.width += WINDOW_SHADOW_SIZE + 8U;
+    result.height += WINDOW_SHADOW_SIZE + 8U;
+    return result;
+}
+
+static bool begin_window_state_animation(
+    uint8_t index,
+    window_animation_type_t type,
+    const wm_window_state_t *target,
+    const ui_rect_t *visual_target,
+    uint32_t duration_ms
+)
+{
+    if (
+        !animations_enabled ||
+        index >= GUI_WINDOW_COUNT ||
+        target == NULL ||
+        visual_target == NULL ||
+        window_animation_active(index) ||
+        !window_surface_valid_for(
+            index,
+            windows[index].state.bounds.width,
+            windows[index].state.bounds.height
+        )
+    )
+    {
+        return false;
+    }
+
+    ui_rect_t from = windows[index].state.bounds;
+
+    if (!window_animation_start(
+        index,
+        type,
+        &from,
+        visual_target,
+        duration_ms
+    ))
+    {
+        return false;
+    }
+
+    animation_targets[index] = *target;
+    animation_target_valid[index] = true;
+    wm_cancel_interaction(&windows[index].state);
+    drag_cache_valid = false;
+
+    ui_rect_t first = animation_visual_bounds(&from);
+    ui_rect_t last = animation_visual_bounds(visual_target);
+    ui_rect_t damage = ui_union(&first, &last);
+    compositor_invalidate(&damage);
+    invalidate_taskbar();
+    return true;
+}
+
+static void update_window_animations(void)
+{
+    for (uint8_t index = 0; index < GUI_WINDOW_COUNT; index++)
+    {
+        if (!window_animation_active(index))
+        {
+            continue;
+        }
+
+        window_animation_type_t type =
+            window_animation_type(index);
+
+        ui_rect_t previous;
+        ui_rect_t current;
+        bool finished = false;
+
+        if (!window_animation_step(
+            index,
+            &previous,
+            &current,
+            &finished
+        ))
+        {
+            continue;
+        }
+
+        ui_rect_t previous_visual =
+            animation_visual_bounds(&previous);
+
+        ui_rect_t current_visual =
+            animation_visual_bounds(&current);
+
+        ui_rect_t damage = ui_union(
+            &previous_visual,
+            &current_visual
+        );
+
+        compositor_invalidate(&damage);
+
+        if (!finished || !animation_target_valid[index])
+        {
+            continue;
+        }
+
+        uint8_t previous_active = active_window_index();
+        windows[index].state = animation_targets[index];
+        animation_target_valid[index] = false;
+
+        if (
+            type == WINDOW_ANIMATION_MAXIMIZE ||
+            type == WINDOW_ANIMATION_RESTORE
+        )
+        {
+            window_surface_invalidate(index);
+        }
+
+        if (
+            windows[index].state.visible &&
+            !windows[index].state.minimized
+        )
+        {
+            bring_window_to_front(index);
+
+            if (
+                previous_active < GUI_WINDOW_COUNT &&
+                previous_active != index
+            )
+            {
+                window_surface_invalidate(previous_active);
+                ui_rect_t previous_bounds =
+                    window_visual_bounds(&windows[previous_active]);
+                compositor_invalidate(&previous_bounds);
+            }
+
+            window_surface_invalidate(index);
+            ui_rect_t final_bounds =
+                window_visual_bounds(&windows[index]);
+            compositor_invalidate(&final_bounds);
+        }
+
+        invalidate_taskbar();
+    }
 }
 
 static void minimize_window(uint8_t index)
@@ -1556,15 +1806,35 @@ static void minimize_window(uint8_t index)
     if (
         index >= GUI_WINDOW_COUNT ||
         !windows[index].state.visible ||
-        windows[index].state.minimized
+        windows[index].state.minimized ||
+        window_animation_active(index)
     )
     {
         return;
     }
 
+    wm_window_state_t target = windows[index].state;
+    target.minimized = true;
+    target.dragging = false;
+    target.resizing = false;
+    target.pending_snap = WM_SNAP_NONE;
+
+    ui_rect_t destination = taskbar_app_button(index);
+
+    if (begin_window_state_animation(
+        index,
+        WINDOW_ANIMATION_MINIMIZE,
+        &target,
+        &destination,
+        150U
+    ))
+    {
+        terminal_focused = false;
+        return;
+    }
+
     ui_rect_t old = window_visual_bounds(&windows[index]);
-    windows[index].state.minimized = true;
-    wm_cancel_interaction(&windows[index].state);
+    windows[index].state = target;
     terminal_focused = false;
     drag_cache_valid = false;
     compositor_invalidate(&old);
@@ -1584,22 +1854,40 @@ static void toggle_maximize_window(uint8_t index)
     if (
         !window->state.visible ||
         window->state.minimized ||
-        window->state.fullscreen
+        window->state.fullscreen ||
+        window_animation_active(index)
     )
     {
         return;
     }
 
-    ui_rect_t old = window_visual_bounds(window);
+    wm_window_state_t target = window->state;
 
     wm_toggle_maximize(
-        &window->state,
+        &target,
         graphics_width(),
         graphics_height(),
         TASKBAR_HEIGHT
     );
 
+    window_animation_type_t type = target.maximized ?
+        WINDOW_ANIMATION_MAXIMIZE : WINDOW_ANIMATION_RESTORE;
+
+    if (begin_window_state_animation(
+        index,
+        type,
+        &target,
+        &target.bounds,
+        165U
+    ))
+    {
+        return;
+    }
+
+    ui_rect_t old = window_visual_bounds(window);
+    window->state = target;
     drag_cache_valid = false;
+    window_surface_invalidate(index);
     compositor_invalidate(&old);
     ui_rect_t next = window_visual_bounds(window);
     compositor_invalidate(&next);
@@ -1612,6 +1900,10 @@ static void toggle_fullscreen_window(uint8_t index)
     {
         return;
     }
+
+    window_animation_cancel(index);
+    animation_target_valid[index] = false;
+    window_surface_invalidate(index);
 
     wm_toggle_fullscreen(
         &windows[index].state,
@@ -1629,26 +1921,51 @@ static void close_window(uint8_t index)
 {
     if (
         index >= GUI_WINDOW_COUNT ||
-        !windows[index].state.visible
+        !windows[index].state.visible ||
+        window_animation_active(index)
     )
     {
         return;
     }
 
-    bool fullscreen = windows[index].state.fullscreen;
+    wm_window_state_t target = windows[index].state;
+    target.visible = false;
+    target.minimized = false;
+    target.maximized = false;
+    target.fullscreen = false;
+    target.dragging = false;
+    target.resizing = false;
+    target.snap = WM_SNAP_NONE;
+    target.pending_snap = WM_SNAP_NONE;
+
+    const ui_rect_t *bounds = &windows[index].state.bounds;
+
+    ui_rect_t destination = {
+        .x = bounds->x + (int32_t)bounds->width / 2 - 36,
+        .y = bounds->y + (int32_t)bounds->height / 2 - 24,
+        .width = 72U,
+        .height = 48U
+    };
+
+    if (begin_window_state_animation(
+        index,
+        WINDOW_ANIMATION_CLOSE,
+        &target,
+        &destination,
+        135U
+    ))
+    {
+        terminal_focused = false;
+        return;
+    }
+
+    bool was_fullscreen = windows[index].state.fullscreen;
     ui_rect_t old = window_visual_bounds(&windows[index]);
-
-    windows[index].state.visible = false;
-    windows[index].state.minimized = false;
-    windows[index].state.maximized = false;
-    windows[index].state.fullscreen = false;
-    windows[index].state.snap = WM_SNAP_NONE;
-    wm_cancel_interaction(&windows[index].state);
-
+    windows[index].state = target;
     terminal_focused = false;
     drag_cache_valid = false;
 
-    if (fullscreen)
+    if (was_fullscreen)
     {
         compositor_invalidate_all();
     }
@@ -1662,16 +1979,18 @@ static void close_window(uint8_t index)
 
 static void activate_window(uint8_t index)
 {
-    if (index >= GUI_WINDOW_COUNT)
+    if (
+        index >= GUI_WINDOW_COUNT ||
+        window_animation_active(index)
+    )
     {
         return;
     }
 
-    invalidate_visible_windows();
-    invalidate_taskbar();
+    uint8_t previous = active_window_index();
+    bool was_visible = windows[index].state.visible;
+    bool was_minimized = windows[index].state.minimized;
 
-    windows[index].state.visible = true;
-    windows[index].state.minimized = false;
     bring_window_to_front(index);
     terminal_focused =
         windows[index].app == GUI_APP_TERMINAL;
@@ -1681,8 +2000,121 @@ static void activate_window(uint8_t index)
         process_manager_refresh();
     }
 
+    if (windows[index].app == GUI_APP_INSTALLER)
+    {
+        windows[index].title = recovery_panel_active ?
+            "LatterOS Recovery" : "Install LatterOS";
+
+        if (recovery_panel_active)
+        {
+            recovery_refresh();
+        }
+        else
+        {
+            installer_refresh();
+
+            if (installer_target_count() == 0)
+            {
+                installer_selected_target = UINT32_MAX;
+                copy_text(
+                    installer_status,
+                    sizeof(installer_status),
+                    installer_last_error()
+                );
+            }
+            else if (
+                installer_selected_target >=
+                    installer_target_count()
+            )
+            {
+                installer_selected_target = 0;
+                copy_text(
+                    installer_status,
+                    sizeof(installer_status),
+                    "Select the dedicated installation target"
+                );
+            }
+        }
+    }
+
     close_popup_menu();
-    invalidate_visible_windows();
+
+    if (
+        (was_minimized || !was_visible) &&
+        window_surface_valid_for(
+            index,
+            windows[index].state.bounds.width,
+            windows[index].state.bounds.height
+        )
+    )
+    {
+        wm_window_state_t target = windows[index].state;
+        target.visible = true;
+        target.minimized = false;
+        target.dragging = false;
+        target.resizing = false;
+
+        ui_rect_t final_bounds = target.bounds;
+        ui_rect_t source;
+        window_animation_type_t type;
+
+        if (was_minimized)
+        {
+            source = taskbar_app_button(index);
+            type = WINDOW_ANIMATION_RESTORE;
+        }
+        else
+        {
+            source = (ui_rect_t){
+                .x = final_bounds.x +
+                    (int32_t)final_bounds.width / 2 - 44,
+                .y = final_bounds.y +
+                    (int32_t)final_bounds.height / 2 - 30,
+                .width = 88U,
+                .height = 60U
+            };
+            type = WINDOW_ANIMATION_OPEN;
+        }
+
+        if (
+            animations_enabled &&
+            window_animation_start(
+                index,
+                type,
+                &source,
+                &final_bounds,
+                155U
+            )
+        )
+        {
+            animation_targets[index] = target;
+            animation_target_valid[index] = true;
+
+            ui_rect_t first = animation_visual_bounds(&source);
+            ui_rect_t last = animation_visual_bounds(&final_bounds);
+            ui_rect_t damage = ui_union(&first, &last);
+            compositor_invalidate(&damage);
+            invalidate_taskbar();
+            return;
+        }
+    }
+
+    if (
+        previous < GUI_WINDOW_COUNT &&
+        previous != index
+    )
+    {
+        window_surface_invalidate(previous);
+        ui_rect_t previous_bounds =
+            window_visual_bounds(&windows[previous]);
+        compositor_invalidate(&previous_bounds);
+    }
+
+    windows[index].state.visible = true;
+    windows[index].state.minimized = false;
+    window_surface_invalidate(index);
+    ui_rect_t current_bounds = window_visual_bounds(&windows[index]);
+    compositor_invalidate(&current_bounds);
     invalidate_taskbar();
 }
 
@@ -1726,13 +2158,7 @@ static void cycle_windows(bool reverse)
             continue;
         }
 
-        windows[candidate].state.minimized = false;
-        bring_window_to_front(candidate);
-        terminal_focused =
-            windows[candidate].app == GUI_APP_TERMINAL;
-
-        close_popup_menu();
-        compositor_invalidate_all();
+        activate_window(candidate);
         return;
     }
 }
@@ -2356,6 +2782,12 @@ static void open_associated_node(vfs_node_t *node)
         return;
     }
 
+    if (association == DESKTOP_ASSOCIATION_PACKAGE)
+    {
+        show_package_install_dialog(path);
+        return;
+    }
+
     desktop_editor_open_node(node);
     activate_window(2);
     desktop_recent_add(path);
@@ -2383,6 +2815,104 @@ static void open_file_picker(void)
         &dialog,
         "Open file",
         explorer_directory
+    );
+
+    desktop_dialog_layout(
+        &dialog,
+        graphics_width(),
+        graphics_height()
+    );
+
+    close_popup_menu();
+    compositor_invalidate_all();
+}
+
+static vfs_node_t *writable_user_directory(void)
+{
+    vfs_node_t *directory = vfs_open("/home/user/Documents");
+
+    if (directory == NULL)
+    {
+        directory = vfs_open("/home/user");
+    }
+
+    return directory != NULL ? directory : vfs_root();
+}
+
+static void show_editor_save_as_dialog(void)
+{
+    pending_action = PENDING_ACTION_EDITOR_SAVE_AS;
+    pending_node = NULL;
+
+    const char *name = desktop_editor_name();
+
+    if (name == NULL || name[0] == '\0')
+    {
+        name = "Untitled.txt";
+    }
+
+    desktop_dialog_show_save_file(
+        &dialog,
+        "Save document as",
+        writable_user_directory(),
+        name
+    );
+
+    desktop_dialog_layout(
+        &dialog,
+        graphics_width(),
+        graphics_height()
+    );
+
+    close_popup_menu();
+    compositor_invalidate_all();
+}
+
+static void show_installer_confirmation(void)
+{
+    installer_target_info_t target;
+
+    if (
+        installer_selected_target == UINT32_MAX ||
+        !installer_target_get(
+            installer_selected_target,
+            &target
+        )
+    )
+    {
+        copy_text(
+            installer_status,
+            sizeof(installer_status),
+            "Select a valid target disk first"
+        );
+        invalidate_window(7);
+        return;
+    }
+
+    pending_action = PENDING_ACTION_INSTALL_PREPARE;
+    pending_node = NULL;
+
+    char message[256];
+    clear_text(message, sizeof(message));
+    append_text(message, sizeof(message), "ERASE ALL DATA on ");
+    append_text(message, sizeof(message), target.name);
+    append_text(message, sizeof(message), " (");
+    append_unsigned_decimal(
+        message,
+        sizeof(message),
+        target.capacity_mib
+    );
+    append_text(
+        message,
+        sizeof(message),
+        " MiB)? LatterOS will write GPT, format EFI and system FAT32 partitions, install Limine UEFI, copy the kernel, and verify every boot file."
+    );
+
+    desktop_dialog_show_confirm(
+        &dialog,
+        recovery_panel_active ?
+            "Reinstall LatterOS" : "Install LatterOS",
+        message
     );
 
     desktop_dialog_layout(
@@ -2583,10 +3113,101 @@ static void show_about_dialog(void)
 {
     pending_action = PENDING_ACTION_NONE;
 
+    char message[256];
+    message[0] = '\0';
+    append_text(message, sizeof(message), release_info_name());
+    append_text(message, sizeof(message), " ");
+    append_text(message, sizeof(message), release_info_version());
+    append_text(message, sizeof(message), " | Milestone ");
+    append_text(message, sizeof(message), release_info_milestone());
+    append_text(message, sizeof(message), " | ");
+    append_text(message, sizeof(message), release_info_architecture());
+    append_text(message, sizeof(message), ". Bootable installer, Safe Mode, Recovery, LDS theme, versioned release images, and LPKG package management. Open .lpkg files in Files and manage installed packages in Settings.");
+
     desktop_dialog_show_message(
         &dialog,
         "About LatterOS",
-        "LatterOS desktop milestone 17: live window resizing, edge and corner snapping, reusable controls, menus, modal dialogs, file pickers, scrollbars, toolbars, status bars, and context menus."
+        message
+    );
+
+    desktop_dialog_layout(
+        &dialog,
+        graphics_width(),
+        graphics_height()
+    );
+
+    close_popup_menu();
+    compositor_invalidate_all();
+}
+
+static void show_package_install_dialog(const char *path)
+{
+    package_info_t information;
+    package_result_t result = package_manager_probe(path, &information);
+
+    if (result != PACKAGE_RESULT_OK)
+    {
+        desktop_notify(package_result_message(result), 6500U);
+        return;
+    }
+
+    pending_action = PENDING_ACTION_PACKAGE_INSTALL;
+    pending_node = NULL;
+    copy_text(pending_path, sizeof(pending_path), path);
+
+    char message[256];
+    message[0] = '\0';
+    append_text(message, sizeof(message), information.installed ?
+        "Update " : "Install ");
+    append_text(message, sizeof(message), information.name);
+    append_text(message, sizeof(message), " ");
+    append_text(message, sizeof(message), information.version);
+    append_text(message, sizeof(message), "? ");
+    append_text(message, sizeof(message), information.description);
+
+    if (information.depends[0] != '\0')
+    {
+        append_text(message, sizeof(message), " Dependencies: ");
+        append_text(message, sizeof(message), information.depends);
+    }
+
+    desktop_dialog_show_confirm(
+        &dialog,
+        information.installed ? "Update package" : "Install package",
+        message
+    );
+
+    desktop_dialog_layout(
+        &dialog,
+        graphics_width(),
+        graphics_height()
+    );
+
+    close_popup_menu();
+    compositor_invalidate_all();
+}
+
+static void show_package_remove_dialog(const char *name)
+{
+    if (name == NULL || name[0] == '\0')
+    {
+        return;
+    }
+
+    pending_action = PENDING_ACTION_PACKAGE_REMOVE;
+    pending_node = NULL;
+    copy_text(pending_path, sizeof(pending_path), name);
+
+    char message[192];
+    message[0] = '\0';
+    append_text(message, sizeof(message), "Remove installed package ");
+    append_text(message, sizeof(message), name);
+    append_text(message, sizeof(message), " and its application files?");
+
+    desktop_dialog_show_confirm(
+        &dialog,
+        "Remove package",
+        message
     );
 
     desktop_dialog_layout(
@@ -2703,6 +3324,94 @@ static void handle_dialog_result(void)
                 desktop_dialog_selected_color(&dialog);
             success = true;
             break;
+
+        case PENDING_ACTION_EDITOR_SAVE_AS:
+            success =
+                selected_path != NULL &&
+                desktop_editor_save_as(selected_path);
+
+            if (success)
+            {
+                window_surface_invalidate(2);
+            }
+            break;
+
+        case PENDING_ACTION_INSTALL_PREPARE:
+            recovery_panel_active = false;
+            windows[7].title = "Install LatterOS";
+            success = installer_start_target(
+                installer_selected_target
+            );
+
+            copy_text(
+                installer_status,
+                sizeof(installer_status),
+                success ?
+                    "[1%] Starting background installation" :
+                    installer_last_error()
+            );
+
+            desktop_notify(
+                success ?
+                    "Installation started - the desktop remains responsive" :
+                    "Unable to start LatterOS installation",
+                success ? 4000U : 7000U
+            );
+            installer_visible_progress = success ? 1U : 0U;
+            window_surface_invalidate(7);
+            break;
+
+        case PENDING_ACTION_PACKAGE_INSTALL:
+        {
+            package_info_t information;
+            package_result_t package_result =
+                package_manager_install(
+                    pending_path,
+                    &information
+                );
+
+            success = package_result == PACKAGE_RESULT_OK;
+
+            if (success)
+            {
+                char notification[96];
+                notification[0] = '\0';
+                append_text(notification, sizeof(notification), "Installed ");
+                append_text(notification, sizeof(notification), information.name);
+                append_text(notification, sizeof(notification), " ");
+                append_text(notification, sizeof(notification), information.version);
+                desktop_notify(notification, 4500U);
+                desktop_recent_add(pending_path);
+            }
+            else
+            {
+                desktop_notify(
+                    package_result_message(package_result),
+                    7000U
+                );
+            }
+
+            settings_page = SETTINGS_PAGE_PACKAGES;
+            window_surface_invalidate(5);
+            break;
+        }
+
+        case PENDING_ACTION_PACKAGE_REMOVE:
+        {
+            package_result_t package_result =
+                package_manager_remove(pending_path);
+            success = package_result == PACKAGE_RESULT_OK;
+
+            desktop_notify(
+                success ? "Package removed" :
+                    package_result_message(package_result),
+                success ? 4000U : 7000U
+            );
+
+            settings_page = SETTINGS_PAGE_PACKAGES;
+            window_surface_invalidate(5);
+            break;
+        }
 
         case PENDING_ACTION_NONE:
         default:
@@ -2872,6 +3581,34 @@ static uint32_t blend_color(
     return (red << 16) | (green << 8) | blue;
 }
 
+static void render_theme_mark(void)
+{
+    if (desktop_services_theme_kind() != DESKTOP_THEME_LDS)
+    {
+        return;
+    }
+
+    const gui_theme_t *theme = desktop_services_theme();
+    uint32_t width = graphics_width();
+    uint32_t height = graphics_height() - TASKBAR_HEIGHT;
+    const char *mark = "LDS";
+    uint32_t scale = 6U;
+    uint32_t mark_width = desktop_font_text_width(mark, scale);
+    uint32_t mark_height = desktop_font_text_height(scale);
+    int32_t x = width > mark_width + 34U ?
+        (int32_t)(width - mark_width - 34U) : 16;
+    int32_t y = height > mark_height + 30U ?
+        (int32_t)(height - mark_height - 30U) : 16;
+    uint32_t color = blend_color(
+        theme->desktop,
+        theme->accent,
+        2U,
+        5U
+    );
+
+    desktop_font_draw_text(mark, x, y, scale, color);
+}
+
 static void render_wallpaper(void)
 {
     const gui_theme_t *theme = desktop_services_theme();
@@ -2883,6 +3620,7 @@ static void render_wallpaper(void)
     if (wallpaper == DESKTOP_WALLPAPER_SOLID)
     {
         graphics_clear(theme->desktop);
+        render_theme_mark();
         return;
     }
 
@@ -2916,6 +3654,7 @@ static void render_wallpaper(void)
             );
         }
 
+        render_theme_mark();
         return;
     }
 
@@ -2939,6 +3678,7 @@ static void render_wallpaper(void)
             draw_rectangle(0, y, width, 1, grid);
         }
 
+        render_theme_mark();
         return;
     }
 
@@ -2956,6 +3696,19 @@ static void render_wallpaper(void)
 
         draw_rectangle(x, y, size, size, 0xDDEBFFU);
     }
+
+    render_theme_mark();
+}
+
+static const char *desktop_icon_label(uint32_t index)
+{
+    if (index == DESKTOP_ICON_COUNT - 1U && boot_mode_is_recovery())
+    {
+        return "Recovery";
+    }
+
+    return index < DESKTOP_ICON_COUNT ?
+        desktop_icons[index].label : "";
 }
 
 static void render_desktop_icons(void)
@@ -2993,8 +3746,10 @@ static void render_desktop_icons(void)
         ui_fill_rect(&symbol, desktop_icons[index].symbol_color);
         ui_draw_border(&symbol, palette.light_text, 2);
 
+        const char *label = desktop_icon_label(index);
+
         char symbol_text[2] = {
-            desktop_icons[index].label[0],
+            label[0],
             '\0'
         };
 
@@ -3007,7 +3762,7 @@ static void render_desktop_icons(void)
         );
 
         uint32_t label_width = desktop_font_text_width(
-            desktop_icons[index].label,
+            label,
             1
         );
         int32_t label_x = bounds.x;
@@ -3020,7 +3775,7 @@ static void render_desktop_icons(void)
         }
 
         desktop_font_draw_text(
-            desktop_icons[index].label,
+            label,
             label_x,
             bounds.y + 51,
             1,
@@ -3122,8 +3877,15 @@ static void render_desktop(void)
         palette.light_text
     );
 
+    const char *desktop_status =
+        boot_mode_is_recovery() ?
+            "Recovery mode - F1 help" :
+        boot_mode_is_safe() ?
+            "Safe mode - F1 help" :
+            "Desktop platform - F1 help";
+
     ui_draw_text(
-        "Desktop platform - F1 help",
+        desktop_status,
         22,
         42,
         palette.light_text
@@ -3248,10 +4010,31 @@ static void render_snap_preview(void)
             TASKBAR_HEIGHT
         );
 
-        ui_rect_t inset = ui_inset(&preview, 5, 5);
-        ui_draw_border(&inset, COLOR_SNAP_PREVIEW, 4);
+        visual_effects_draw_snap_preview(
+            &preview,
+            COLOR_SNAP_PREVIEW
+        );
         return;
     }
+}
+
+static void render_window_shadow(
+    const gui_window_t *window
+)
+{
+    if (
+        window == NULL ||
+        window->state.fullscreen ||
+        window->state.maximized
+    )
+    {
+        return;
+    }
+
+    visual_effects_draw_shadow(
+        &window->state.bounds,
+        COLOR_SHADOW
+    );
 }
 
 static void render_window_frame(
@@ -3265,23 +4048,25 @@ static void render_window_frame(
     }
 
     ui_palette_t palette = current_palette();
+    uint32_t radius = window->state.maximized ? 0U : 7U;
 
-    ui_rect_t shadow = {
-        .x = window->state.bounds.x +
-            (int32_t)WINDOW_SHADOW_SIZE,
-        .y = window->state.bounds.y +
-            (int32_t)WINDOW_SHADOW_SIZE,
-        .width = window->state.bounds.width,
-        .height = window->state.bounds.height
-    };
-
-    ui_fill_rect(&shadow, COLOR_SHADOW);
-    ui_fill_rect(&window->state.bounds, palette.panel);
-    ui_draw_border(&window->state.bounds, palette.border, 2);
+    visual_effects_draw_rounded_border(
+        &window->state.bounds,
+        radius,
+        2U,
+        palette.border,
+        palette.panel
+    );
 
     ui_rect_t title = window_title_bar(window);
-    ui_fill_rect(
+    title.x += 2;
+    title.y += 2;
+    title.width = title.width > 4U ? title.width - 4U : 1U;
+    title.height = title.height > 2U ? title.height - 2U : 1U;
+
+    visual_effects_fill_top_rounded_rect(
         &title,
+        radius > 2U ? radius - 2U : 0U,
         window_is_front(index) ?
             palette.accent : desktop_services_theme()->title_idle
     );
@@ -3702,6 +4487,908 @@ static void render_explorer_app(
     );
 }
 
+static ui_rect_t installer_refresh_bounds(
+    const ui_rect_t *content
+)
+{
+    return (ui_rect_t){
+        content->x + 12,
+        content->y + 10,
+        92,
+        26
+    };
+}
+
+static ui_rect_t installer_prepare_bounds(
+    const ui_rect_t *content
+)
+{
+    return (ui_rect_t){
+        content->x + 112,
+        content->y + 10,
+        142,
+        26
+    };
+}
+
+static ui_rect_t installer_list_bounds(
+    const ui_rect_t *content
+)
+{
+    return (ui_rect_t){
+        content->x + 12,
+        content->y + 68,
+        content->width > 24U ? content->width - 24U : 1U,
+        content->height > 112U ? content->height - 112U : 1U
+    };
+}
+
+static ui_rect_t installer_status_bounds(
+    const ui_rect_t *content
+)
+{
+    return (ui_rect_t){
+        content->x + 12,
+        content->y + (int32_t)content->height - 34,
+        content->width > 24U ? content->width - 24U : 1U,
+        24
+    };
+}
+
+static void installer_target_label(
+    const installer_target_info_t *target,
+    char *label,
+    size_t capacity
+)
+{
+    clear_text(label, capacity);
+
+    if (target == NULL)
+    {
+        return;
+    }
+
+    append_text(label, capacity, target->name);
+    append_text(label, capacity, " - ");
+    append_unsigned_decimal(label, capacity, target->capacity_mib);
+    append_text(label, capacity, " MiB - 512-byte sectors");
+}
+
+static void render_installer_app(const ui_rect_t *content)
+{
+    const gui_theme_t *theme = desktop_services_theme();
+    ui_palette_t colors = {
+        .background = theme->desktop,
+        .panel = theme->window,
+        .border = theme->window_border,
+        .text = theme->text,
+        .light_text = theme->light_text,
+        .field = theme->field,
+        .accent = theme->accent,
+        .accent_hover = theme->row_selected,
+        .selected = theme->row_selected,
+        .disabled = theme->title_idle,
+        .danger = theme->close
+    };
+
+    ui_rect_t refresh = installer_refresh_bounds(content);
+    ui_rect_t prepare = installer_prepare_bounds(content);
+    ui_rect_t list = installer_list_bounds(content);
+    ui_rect_t status = installer_status_bounds(content);
+
+    bool installing = installer_running();
+
+    ui_control_draw_button(
+        &refresh,
+        "Refresh",
+        &colors,
+        installing ? UI_CONTROL_DISABLED : UI_CONTROL_NORMAL
+    );
+
+    ui_control_draw_button(
+        &prepare,
+        installing ? "Installing..." : "Install LatterOS",
+        &colors,
+        installing || installer_selected_target == UINT32_MAX ?
+            UI_CONTROL_DISABLED : UI_CONTROL_NORMAL
+    );
+
+    ui_draw_text(
+        "Destructive installation: all data on the selected disk will be erased.",
+        content->x + 12,
+        content->y + 46,
+        colors.danger
+    );
+
+    ui_fill_rect(&list, colors.field);
+    ui_draw_border(&list, colors.border, 1);
+
+    uint32_t count = installer_target_count();
+    uint32_t visible = count < INSTALLER_VISIBLE_ROWS ?
+        count : INSTALLER_VISIBLE_ROWS;
+
+    if (visible == 0)
+    {
+        ui_draw_text(
+            "No safe installation target detected.",
+            list.x + 8,
+            list.y + 10,
+            colors.disabled
+        );
+    }
+
+    for (uint32_t row = 0; row < visible; row++)
+    {
+        installer_target_info_t target;
+
+        if (!installer_target_get(row, &target))
+        {
+            continue;
+        }
+
+        ui_rect_t row_bounds = {
+            list.x + 3,
+            list.y + 3 + (int32_t)row * 30,
+            list.width > 6U ? list.width - 6U : 1U,
+            28
+        };
+
+        char label[128];
+        installer_target_label(
+            &target,
+            label,
+            sizeof(label)
+        );
+
+        ui_control_draw_list_row(
+            &row_bounds,
+            row == installer_selected_target ? ">" : "",
+            label,
+            &colors,
+            row == installer_selected_target,
+            false
+        );
+    }
+
+    ui_control_draw_statusbar(
+        &status,
+        installer_status,
+        installing ? "Installing" : "Milestone 19D",
+        &colors
+    );
+}
+
+static bool handle_installer_click(
+    const ui_rect_t *content,
+    int32_t x,
+    int32_t y
+)
+{
+    ui_rect_t refresh = installer_refresh_bounds(content);
+    ui_rect_t prepare = installer_prepare_bounds(content);
+    ui_rect_t list = installer_list_bounds(content);
+
+    if (installer_running())
+    {
+        copy_text(
+            installer_status,
+            sizeof(installer_status),
+            "Installation in progress - wait for verification"
+        );
+        return true;
+    }
+
+    if (ui_point_in_rect(x, y, &refresh))
+    {
+        installer_refresh();
+        installer_selected_target =
+            installer_target_count() == 0 ? UINT32_MAX : 0U;
+        copy_text(
+            installer_status,
+            sizeof(installer_status),
+            installer_target_count() == 0 ?
+                installer_last_error() :
+                "Disk list refreshed"
+        );
+        return true;
+    }
+
+    if (
+        ui_point_in_rect(x, y, &prepare) &&
+        installer_selected_target != UINT32_MAX
+    )
+    {
+        show_installer_confirmation();
+        return true;
+    }
+
+    if (ui_point_in_rect(x, y, &list))
+    {
+        int32_t relative = y - list.y - 3;
+
+        if (relative >= 0)
+        {
+            uint32_t row = (uint32_t)relative / 30U;
+
+            if (row < installer_target_count())
+            {
+                installer_selected_target = row;
+                copy_text(
+                    installer_status,
+                    sizeof(installer_status),
+                    "Target selected - verify capacity before preparing"
+                );
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static ui_rect_t desktop_settings_tab_button(
+    const ui_rect_t *content,
+    uint32_t index
+)
+{
+    uint32_t gap = 8U;
+    uint32_t width = (content->width - 52U) / 3U;
+
+    return (ui_rect_t){
+        .x = content->x + 18 +
+            (int32_t)index * (int32_t)(width + gap),
+        .y = content->y + 12,
+        .width = width,
+        .height = 32U
+    };
+}
+
+static ui_rect_t desktop_settings_theme_button(
+    const ui_rect_t *content,
+    uint32_t index
+)
+{
+    uint32_t column = index % 2U;
+    uint32_t row = index / 2U;
+    uint32_t gap = 10U;
+    uint32_t width = (content->width - 46U) / 2U;
+
+    return (ui_rect_t){
+        .x = content->x + 18 +
+            (int32_t)column * (int32_t)(width + gap),
+        .y = content->y + 92 + (int32_t)row * 40,
+        .width = width,
+        .height = 30U
+    };
+}
+
+static ui_rect_t desktop_settings_wallpaper_button(
+    const ui_rect_t *content,
+    uint32_t index
+)
+{
+    uint32_t gap = 8U;
+    uint32_t width = (content->width - 60U) / 4U;
+
+    return (ui_rect_t){
+        .x = content->x + 18 +
+            (int32_t)index * (int32_t)(width + gap),
+        .y = content->y + 244,
+        .width = width,
+        .height = 30U
+    };
+}
+
+static ui_rect_t desktop_settings_reset_button(
+    const ui_rect_t *content
+)
+{
+    return (ui_rect_t){
+        .x = content->x + 18,
+        .y = content->y + 292,
+        .width = content->width - 36U,
+        .height = 32U
+    };
+}
+
+static ui_rect_t desktop_settings_package_row(
+    const ui_rect_t *content,
+    uint32_t index
+)
+{
+    return (ui_rect_t){
+        .x = content->x + 18,
+        .y = content->y + 104 + (int32_t)index * 48,
+        .width = content->width - 36U,
+        .height = 40U
+    };
+}
+
+static ui_rect_t desktop_settings_package_remove_button(
+    const ui_rect_t *row
+)
+{
+    return (ui_rect_t){
+        .x = row->x + (int32_t)row->width - 86,
+        .y = row->y + 7,
+        .width = 76U,
+        .height = 26U
+    };
+}
+
+static ui_rect_t desktop_settings_hardware_action_button(
+    const ui_rect_t *content,
+    uint32_t index
+)
+{
+    uint32_t gap = 8U;
+    uint32_t width = (content->width - 52U) / 3U;
+
+    return (ui_rect_t){
+        .x = content->x + 18 +
+            (int32_t)index * (int32_t)(width + gap),
+        .y = content->y + 322,
+        .width = width,
+        .height = 30U
+    };
+}
+
+static void desktop_settings_render_tabs(
+    const ui_rect_t *content,
+    const ui_palette_t *palette
+)
+{
+    static const char *labels[3] = {
+        "Appearance",
+        "Packages",
+        "Hardware"
+    };
+
+    for (uint32_t index = 0; index < 3U; index++)
+    {
+        ui_rect_t tab = desktop_settings_tab_button(content, index);
+
+        ui_control_draw_button(
+            &tab,
+            labels[index],
+            palette,
+            settings_page == (settings_page_t)index ?
+                UI_CONTROL_FOCUSED : UI_CONTROL_NORMAL
+        );
+    }
+}
+
+static void desktop_settings_render_appearance(
+    const ui_rect_t *content,
+    const ui_palette_t *palette
+)
+{
+    ui_draw_text(
+        "Desktop theme",
+        content->x + 18,
+        content->y + 66,
+        palette->disabled
+    );
+
+    static const char *theme_labels[6] = {
+        "Blue",
+        "Graphite",
+        "Teal",
+        "Aubergine",
+        "External",
+        "LDS"
+    };
+
+    static const desktop_theme_kind_t theme_kinds[6] = {
+        DESKTOP_THEME_BLUE,
+        DESKTOP_THEME_GRAPHITE,
+        DESKTOP_THEME_TEAL,
+        DESKTOP_THEME_AUBERGINE,
+        DESKTOP_THEME_EXTERNAL,
+        DESKTOP_THEME_LDS
+    };
+
+    desktop_theme_kind_t selected_theme =
+        desktop_services_theme_kind();
+
+    for (uint32_t index = 0; index < 6U; index++)
+    {
+        ui_rect_t button =
+            desktop_settings_theme_button(content, index);
+
+        ui_control_draw_button(
+            &button,
+            theme_labels[index],
+            palette,
+            selected_theme == theme_kinds[index] ?
+                UI_CONTROL_FOCUSED : UI_CONTROL_NORMAL
+        );
+    }
+
+    ui_draw_text(
+        "Wallpaper",
+        content->x + 18,
+        content->y + 222,
+        palette->disabled
+    );
+
+    static const char *wallpaper_labels[4] = {
+        "Solid", "Gradient", "Grid", "Night"
+    };
+
+    desktop_wallpaper_t selected_wallpaper =
+        desktop_services_wallpaper();
+
+    for (uint32_t index = 0; index < 4U; index++)
+    {
+        ui_rect_t button =
+            desktop_settings_wallpaper_button(content, index);
+
+        ui_control_draw_button(
+            &button,
+            wallpaper_labels[index],
+            palette,
+            selected_wallpaper == (desktop_wallpaper_t)index ?
+                UI_CONTROL_FOCUSED : UI_CONTROL_NORMAL
+        );
+    }
+
+    ui_rect_t reset = desktop_settings_reset_button(content);
+    ui_control_draw_button(
+        &reset,
+        "Reset desktop appearance and saved layout",
+        palette,
+        UI_CONTROL_NORMAL
+    );
+
+    ui_draw_text(
+        "LDS uses deep blue, white, and gold with a subtle LDS desktop mark.",
+        content->x + 18,
+        content->y + 338,
+        palette->disabled
+    );
+}
+
+static void desktop_settings_render_packages(
+    const ui_rect_t *content,
+    const ui_palette_t *palette
+)
+{
+    ui_draw_text(
+        "Open a .lpkg file in Files to inspect, install, or update it.",
+        content->x + 18,
+        content->y + 60,
+        palette->disabled
+    );
+
+    uint32_t count = package_manager_installed_count();
+    char count_text[64] = "Installed packages: ";
+    append_unsigned_decimal(count_text, sizeof(count_text), count);
+
+    ui_draw_text(
+        count_text,
+        content->x + 18,
+        content->y + 82,
+        palette->text
+    );
+
+    if (count == 0)
+    {
+        ui_draw_text(
+            "No application packages are installed yet.",
+            content->x + 18,
+            content->y + 124,
+            palette->disabled
+        );
+        return;
+    }
+
+    uint32_t visible = count > 5U ? 5U : count;
+
+    for (uint32_t index = 0; index < visible; index++)
+    {
+        package_info_t information;
+
+        if (!package_manager_installed_get(index, &information))
+        {
+            continue;
+        }
+
+        ui_rect_t row = desktop_settings_package_row(content, index);
+        ui_fill_rect(&row, palette->field);
+        ui_draw_border(&row, palette->border, 1U);
+
+        char label[96];
+        label[0] = '\0';
+        append_text(label, sizeof(label), information.name);
+        append_text(label, sizeof(label), "  ");
+        append_text(label, sizeof(label), information.version);
+
+        ui_draw_text(
+            label,
+            row.x + 10,
+            row.y + 6,
+            palette->text
+        );
+
+        ui_rect_t description_bounds = {
+            .x = row.x + 6,
+            .y = row.y + 18,
+            .width = row.width > 104U ? row.width - 104U : row.width,
+            .height = 18U
+        };
+
+        ui_draw_text_ellipsized(
+            information.description[0] != '\0' ?
+                information.description : "Installed LPKG package",
+            &description_bounds,
+            4,
+            palette->disabled
+        );
+
+        ui_rect_t remove =
+            desktop_settings_package_remove_button(&row);
+        ui_control_draw_button(
+            &remove,
+            "Remove",
+            palette,
+            UI_CONTROL_NORMAL
+        );
+    }
+
+    if (count > visible)
+    {
+        ui_draw_text(
+            "Only the first five packages are shown.",
+            content->x + 18,
+            content->y + 354,
+            palette->disabled
+        );
+    }
+}
+
+static void desktop_settings_draw_hardware_line(
+    const ui_rect_t *content,
+    const ui_palette_t *palette,
+    int32_t y,
+    const char *text,
+    bool emphasized
+)
+{
+    ui_rect_t bounds = {
+        .x = content->x + 18,
+        .y = content->y + y,
+        .width = content->width - 36U,
+        .height = 18U
+    };
+
+    ui_draw_text_ellipsized(
+        text,
+        &bounds,
+        4,
+        emphasized ? palette->text : palette->disabled
+    );
+}
+
+static void desktop_settings_render_hardware(
+    const ui_rect_t *content,
+    const ui_palette_t *palette
+)
+{
+    const hardware_compat_snapshot_t *snapshot =
+        hardware_compat_snapshot();
+
+    char line[192];
+    line[0] = '\0';
+    append_text(line, sizeof(line), "Compatibility: ");
+    append_text(line, sizeof(line), hardware_compat_status_name());
+    desktop_settings_draw_hardware_line(
+        content,
+        palette,
+        60,
+        line,
+        true
+    );
+
+    desktop_settings_draw_hardware_line(
+        content,
+        palette,
+        80,
+        hardware_compat_summary(),
+        false
+    );
+
+    line[0] = '\0';
+    append_text(line, sizeof(line), "CPU: ");
+    append_text(line, sizeof(line), snapshot->cpu_brand);
+    desktop_settings_draw_hardware_line(content, palette, 106, line, true);
+
+    line[0] = '\0';
+    append_text(line, sizeof(line), "CPU cores online/detected: ");
+    append_unsigned_decimal(line, sizeof(line), snapshot->online_cpus);
+    append_text(line, sizeof(line), "/");
+    append_unsigned_decimal(line, sizeof(line), snapshot->detected_cpus);
+    desktop_settings_draw_hardware_line(content, palette, 126, line, false);
+
+    line[0] = '\0';
+    append_text(line, sizeof(line), "Memory usable/total MiB: ");
+    append_unsigned_decimal(
+        line,
+        sizeof(line),
+        (uint32_t)(snapshot->usable_memory_bytes / (1024ULL * 1024ULL))
+    );
+    append_text(line, sizeof(line), "/");
+    append_unsigned_decimal(
+        line,
+        sizeof(line),
+        (uint32_t)(snapshot->total_memory_bytes / (1024ULL * 1024ULL))
+    );
+    desktop_settings_draw_hardware_line(content, palette, 146, line, false);
+
+    line[0] = '\0';
+    append_text(line, sizeof(line), "ACPI: ");
+    append_text(line, sizeof(line), snapshot->acpi_available ? "ready " : "missing ");
+    append_text(line, sizeof(line), snapshot->acpi_root);
+    append_text(line, sizeof(line), " OEM ");
+    append_text(line, sizeof(line), snapshot->acpi_oem);
+    desktop_settings_draw_hardware_line(content, palette, 166, line, false);
+
+    line[0] = '\0';
+    append_text(line, sizeof(line), "PCI devices: ");
+    append_unsigned_decimal(line, sizeof(line), snapshot->pci_devices);
+    append_text(line, sizeof(line), "  storage/network/display: ");
+    append_unsigned_decimal(line, sizeof(line), snapshot->pci_storage);
+    append_text(line, sizeof(line), "/");
+    append_unsigned_decimal(line, sizeof(line), snapshot->pci_network);
+    append_text(line, sizeof(line), "/");
+    append_unsigned_decimal(line, sizeof(line), snapshot->pci_display);
+    desktop_settings_draw_hardware_line(content, palette, 186, line, false);
+
+    line[0] = '\0';
+    append_text(line, sizeof(line), "Block devices: ");
+    append_unsigned_decimal(line, sizeof(line), snapshot->block_devices);
+    append_text(line, sizeof(line), "  AHCI/NVMe: ");
+    append_unsigned_decimal(line, sizeof(line), snapshot->ahci_devices);
+    append_text(line, sizeof(line), "/");
+    append_unsigned_decimal(line, sizeof(line), snapshot->nvme_namespaces);
+    desktop_settings_draw_hardware_line(content, palette, 206, line, false);
+
+    line[0] = '\0';
+    append_text(line, sizeof(line), "USB: ");
+    append_text(line, sizeof(line), snapshot->usb_ready ? "ready" : "unavailable");
+    append_text(line, sizeof(line), " devices=");
+    append_unsigned_decimal(line, sizeof(line), snapshot->usb_devices);
+    append_text(line, sizeof(line), " keyboard/mouse=");
+    append_text(line, sizeof(line), snapshot->usb_keyboard ? "yes" : "no");
+    append_text(line, sizeof(line), "/");
+    append_text(line, sizeof(line), snapshot->usb_mouse ? "yes" : "no");
+    desktop_settings_draw_hardware_line(content, palette, 226, line, false);
+
+    line[0] = '\0';
+    append_text(line, sizeof(line), "Network ready/link: ");
+    append_text(line, sizeof(line), snapshot->network_ready ? "yes" : "no");
+    append_text(line, sizeof(line), "/");
+    append_text(line, sizeof(line), snapshot->network_link ? "up" : "down");
+    desktop_settings_draw_hardware_line(content, palette, 246, line, false);
+
+    line[0] = '\0';
+    append_text(line, sizeof(line), "Display: ");
+    append_text(line, sizeof(line), snapshot->display_backend);
+    append_text(line, sizeof(line), " ");
+    append_unsigned_decimal(line, sizeof(line), snapshot->display_width);
+    append_text(line, sizeof(line), "x");
+    append_unsigned_decimal(line, sizeof(line), snapshot->display_height);
+    append_text(line, sizeof(line), " @ ");
+    append_unsigned_decimal(line, sizeof(line), snapshot->display_refresh_hz);
+    append_text(line, sizeof(line), " Hz");
+    desktop_settings_draw_hardware_line(content, palette, 266, line, false);
+
+    line[0] = '\0';
+    append_text(line, sizeof(line), "Warnings/failures: ");
+    append_unsigned_decimal(line, sizeof(line), snapshot->warning_count);
+    append_text(line, sizeof(line), "/");
+    append_unsigned_decimal(line, sizeof(line), snapshot->failure_count);
+    desktop_settings_draw_hardware_line(content, palette, 286, line, true);
+
+    static const char *action_labels[3] = {
+        "Refresh",
+        "Quick test",
+        "Save report"
+    };
+
+    for (uint32_t index = 0; index < 3U; index++)
+    {
+        ui_rect_t button =
+            desktop_settings_hardware_action_button(content, index);
+        ui_control_draw_button(
+            &button,
+            action_labels[index],
+            palette,
+            UI_CONTROL_NORMAL
+        );
+    }
+
+    desktop_settings_draw_hardware_line(
+        content,
+        palette,
+        360,
+        "Reports are saved to Documents/Hardware Compatibility Report.txt",
+        false
+    );
+}
+
+static void desktop_settings_render(const ui_rect_t *content)
+{
+    if (content == NULL)
+    {
+        return;
+    }
+
+    ui_palette_t palette = current_palette();
+    desktop_settings_render_tabs(content, &palette);
+
+    switch (settings_page)
+    {
+        case SETTINGS_PAGE_PACKAGES:
+            desktop_settings_render_packages(content, &palette);
+            break;
+
+        case SETTINGS_PAGE_HARDWARE:
+            desktop_settings_render_hardware(content, &palette);
+            break;
+
+        case SETTINGS_PAGE_APPEARANCE:
+        default:
+            desktop_settings_render_appearance(content, &palette);
+            break;
+    }
+}
+
+static bool desktop_settings_handle_click(
+    const ui_rect_t *content,
+    int32_t x,
+    int32_t y
+)
+{
+    if (content == NULL)
+    {
+        return false;
+    }
+
+    for (uint32_t index = 0; index < 3U; index++)
+    {
+        ui_rect_t tab = desktop_settings_tab_button(content, index);
+
+        if (ui_point_in_rect(x, y, &tab))
+        {
+            settings_page = (settings_page_t)index;
+            return true;
+        }
+    }
+
+    if (settings_page == SETTINGS_PAGE_PACKAGES)
+    {
+        uint32_t count = package_manager_installed_count();
+        uint32_t visible = count > 5U ? 5U : count;
+
+        for (uint32_t index = 0; index < visible; index++)
+        {
+            package_info_t information;
+
+            if (!package_manager_installed_get(index, &information))
+            {
+                continue;
+            }
+
+            ui_rect_t row = desktop_settings_package_row(content, index);
+            ui_rect_t remove =
+                desktop_settings_package_remove_button(&row);
+
+            if (ui_point_in_rect(x, y, &remove))
+            {
+                show_package_remove_dialog(information.name);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    if (settings_page == SETTINGS_PAGE_HARDWARE)
+    {
+        for (uint32_t index = 0; index < 3U; index++)
+        {
+            ui_rect_t button =
+                desktop_settings_hardware_action_button(content, index);
+
+            if (!ui_point_in_rect(x, y, &button))
+            {
+                continue;
+            }
+
+            if (index == 0U)
+            {
+                hardware_compat_refresh();
+            }
+            else if (index == 1U)
+            {
+                (void)hardware_compat_run_quick_test();
+            }
+            else
+            {
+                (void)hardware_compat_write_report();
+            }
+
+            desktop_notify(hardware_compat_last_message(), 5000U);
+            return true;
+        }
+
+        return false;
+    }
+
+    static const desktop_theme_kind_t theme_kinds[6] = {
+        DESKTOP_THEME_BLUE,
+        DESKTOP_THEME_GRAPHITE,
+        DESKTOP_THEME_TEAL,
+        DESKTOP_THEME_AUBERGINE,
+        DESKTOP_THEME_EXTERNAL,
+        DESKTOP_THEME_LDS
+    };
+
+    for (uint32_t index = 0; index < 6U; index++)
+    {
+        ui_rect_t button =
+            desktop_settings_theme_button(content, index);
+
+        if (!ui_point_in_rect(x, y, &button))
+        {
+            continue;
+        }
+
+        bool saved = desktop_services_set_theme(theme_kinds[index]);
+        chrome_accent = desktop_services_theme()->accent;
+        desktop_notify(
+            saved ? desktop_services_theme_name() :
+                "Theme applied, but configuration could not be saved",
+            4500U
+        );
+        return true;
+    }
+
+    for (uint32_t index = 0; index < 4U; index++)
+    {
+        ui_rect_t button =
+            desktop_settings_wallpaper_button(content, index);
+
+        if (!ui_point_in_rect(x, y, &button))
+        {
+            continue;
+        }
+
+        (void)desktop_services_set_wallpaper(
+            (desktop_wallpaper_t)index
+        );
+        desktop_notify(desktop_services_wallpaper_name(), 3500U);
+        return true;
+    }
+
+    ui_rect_t reset = desktop_settings_reset_button(content);
+
+    if (ui_point_in_rect(x, y, &reset))
+    {
+        bool saved = desktop_services_reset_configuration();
+        chrome_accent = desktop_services_theme()->accent;
+        desktop_notify(
+            saved ? "Desktop settings reset" :
+                "Desktop reset applied, but save failed",
+            4500U
+        );
+        return true;
+    }
+
+    return false;
+}
+
 static void render_window(
     uint8_t index,
     const gui_window_t *window
@@ -3715,63 +5402,109 @@ static void render_window(
         return;
     }
 
+    render_window_shadow(window);
+
+    if (
+        !window->state.dragging &&
+        !window->state.resizing &&
+        window_surface_draw(index, &window->state.bounds)
+    )
+    {
+        return;
+    }
+
     render_window_frame(index, window);
 
     if (window->app == GUI_APP_TERMINAL)
     {
         render_terminal_app(window);
-        return;
     }
-
-    if (window->app == GUI_APP_FILE_EXPLORER)
+    else if (window->app == GUI_APP_FILE_EXPLORER)
     {
         render_explorer_app(window);
-        return;
     }
-
-    ui_rect_t content = window_content_bounds(window);
-
-    switch (window->app)
+    else
     {
-        case GUI_APP_TEXT_EDITOR:
-            desktop_editor_render(&content);
-            break;
+        ui_rect_t content = window_content_bounds(window);
 
-        case GUI_APP_CALCULATOR:
-            calculator_render(&content);
-            break;
+        switch (window->app)
+        {
+            case GUI_APP_TEXT_EDITOR:
+                desktop_editor_render(&content);
+                break;
 
-        case GUI_APP_PAINT:
-            paint_render(&content);
-            break;
+            case GUI_APP_CALCULATOR:
+                calculator_render(&content);
+                break;
 
-        case GUI_APP_SETTINGS:
-            settings_render(&content);
-            break;
+            case GUI_APP_PAINT:
+                paint_render(&content);
+                break;
 
-        case GUI_APP_PROCESS_MANAGER:
-            process_manager_render(&content);
-            break;
+            case GUI_APP_SETTINGS:
+                desktop_settings_render(&content);
+                break;
 
-        default:
-            break;
+            case GUI_APP_PROCESS_MANAGER:
+                process_manager_render(&content);
+                break;
+
+            case GUI_APP_INSTALLER:
+                if (recovery_panel_active)
+                {
+                    recovery_render(&content);
+                }
+                else
+                {
+                    render_installer_app(&content);
+                }
+                break;
+
+            default:
+                break;
+        }
     }
+
+    if (
+        !window->state.dragging &&
+        !window->state.resizing
+    )
+    {
+        (void)window_surface_capture(
+            index,
+            &window->state.bounds
+        );
+    }
+}
+
+static bool render_animated_window(uint8_t index)
+{
+    ui_rect_t bounds;
+
+    if (
+        index >= GUI_WINDOW_COUNT ||
+        !window_animation_bounds(index, &bounds)
+    )
+    {
+        return false;
+    }
+
+    if (
+        bounds.width > 96U &&
+        bounds.height > 64U
+    )
+    {
+        visual_effects_draw_shadow(&bounds, COLOR_SHADOW);
+    }
+
+    return window_surface_draw_scaled(index, &bounds);
 }
 
 static void render_cached_drag_window(
     const gui_window_t *window
 )
 {
-    ui_rect_t shadow = {
-        .x = window->state.bounds.x +
-            (int32_t)WINDOW_SHADOW_SIZE,
-        .y = window->state.bounds.y +
-            (int32_t)WINDOW_SHADOW_SIZE,
-        .width = window->state.bounds.width,
-        .height = window->state.bounds.height
-    };
-
-    ui_fill_rect(&shadow, COLOR_SHADOW);
+    render_window_shadow(window);
 
     graphics_blit_surface(
         drag_cache,
@@ -3802,7 +5535,11 @@ static void render_gui_scene(void)
         {
             uint8_t index = window_order[order];
 
-            if (
+            if (window_animation_active(index))
+            {
+                (void)render_animated_window(index);
+            }
+            else if (
                 drag_cache_valid &&
                 drag_cache_window == index &&
                 windows[index].state.dragging
@@ -4013,6 +5750,18 @@ static void execute_system_command(uint32_t command)
             compositor_invalidate_all();
             break;
         }
+
+        case SYSTEM_COMMAND_INSTALLER:
+            recovery_panel_active = false;
+            windows[7].title = "Install LatterOS";
+            activate_window(7);
+            break;
+
+        case SYSTEM_COMMAND_RECOVERY:
+            recovery_panel_active = true;
+            windows[7].title = "LatterOS Recovery";
+            activate_window(7);
+            break;
 
         case SYSTEM_COMMAND_ABOUT:
             show_about_dialog();
@@ -4422,6 +6171,12 @@ static bool handle_window_content_click(
     {
         case GUI_APP_TEXT_EDITOR:
             changed = desktop_editor_handle_click(&content, x, y);
+
+            if (desktop_editor_take_save_as_request())
+            {
+                show_editor_save_as_dialog();
+                return true;
+            }
             break;
 
         case GUI_APP_CALCULATOR:
@@ -4438,6 +6193,16 @@ static bool handle_window_content_click(
                 &damage
             );
 
+            if (changed)
+            {
+                /*
+                 * Paint changes its canvas model continuously. The layered
+                 * compositor must discard the cached window surface before
+                 * presenting the damage, otherwise it redraws stale pixels.
+                 */
+                window_surface_invalidate(index);
+            }
+
             if (
                 changed &&
                 damage.width != 0 &&
@@ -4452,7 +6217,7 @@ static bool handle_window_content_click(
         }
 
         case GUI_APP_SETTINGS:
-            changed = settings_handle_click(
+            changed = desktop_settings_handle_click(
                 &content,
                 x,
                 y
@@ -4471,6 +6236,33 @@ static bool handle_window_content_click(
                 x,
                 y
             );
+            break;
+
+        case GUI_APP_INSTALLER:
+            if (recovery_panel_active)
+            {
+                changed = recovery_handle_click(&content, x, y);
+
+                uint32_t reinstall_target = UINT32_MAX;
+
+                if (recovery_take_reinstall_request(&reinstall_target))
+                {
+                    installer_selected_target = reinstall_target;
+                    show_installer_confirmation();
+                    return true;
+                }
+
+                if (changed)
+                {
+                    chrome_accent = desktop_services_theme()->accent;
+                    compositor_invalidate_all();
+                    return true;
+                }
+            }
+            else
+            {
+                changed = handle_installer_click(&content, x, y);
+            }
             break;
 
         default:
@@ -4542,6 +6334,7 @@ static void handle_mouse_down(int32_t x, int32_t y)
         gui_window_t *window = &windows[index];
 
         if (
+            window_animation_active(index) ||
             !window->state.visible ||
             window->state.minimized
         )
@@ -4572,6 +6365,7 @@ static void handle_mouse_down(int32_t x, int32_t y)
         if (resize_edges != WM_RESIZE_NONE)
         {
             drag_cache_valid = false;
+            window_surface_invalidate(index);
             (void)wm_begin_resize(
                 &window->state,
                 resize_edges,
@@ -4770,6 +6564,7 @@ static void handle_mouse_move(int32_t x, int32_t y)
 
         if (window->state.resizing)
         {
+            window_surface_invalidate(index);
             ui_rect_t old = window_visual_bounds(window);
 
             if (wm_update_resize(
@@ -4898,6 +6693,9 @@ static void handle_mouse_move(int32_t x, int32_t y)
             &damage
         ))
         {
+            /* Keep every live stroke segment visible in the same frame. */
+            window_surface_invalidate(index);
+
             if (damage.width != 0 && damage.height != 0)
             {
                 compositor_invalidate(&damage);
@@ -5087,6 +6885,8 @@ static void handle_mouse_up(void)
 
     if (interacted)
     {
+        window_surface_invalidate_all();
+
         for (uint32_t index = 0; index < GUI_WINDOW_COUNT; index++)
         {
             const wm_window_state_t *state = &windows[index].state;
@@ -5442,7 +7242,12 @@ static void handle_shortcut(gui_shortcut_t shortcut)
             {
                 if (desktop_editor_save())
                 {
+                    window_surface_invalidate(index);
                     invalidate_window(index);
+                }
+                else if (desktop_editor_take_save_as_request())
+                {
+                    show_editor_save_as_dialog();
                 }
             }
             break;
@@ -5495,6 +7300,14 @@ static void process_events(void)
 
     while (active && pop_event(&event))
     {
+        if (
+            installer_running() &&
+            event.type != GUI_EVENT_MOUSE_MOVE
+        )
+        {
+            continue;
+        }
+
         switch (event.type)
         {
             case GUI_EVENT_MOUSE_MOVE:
@@ -5737,8 +7550,24 @@ static void start_gui(void)
 
     graphics_set_deferred(true);
     compositor_init(render_gui_scene);
+    window_surface_init();
+    window_animation_init();
 
-    if (virtio_gpu_available())
+    for (uint32_t index = 0; index < GUI_WINDOW_COUNT; index++)
+    {
+        animation_target_valid[index] = false;
+    }
+
+    if (boot_mode_conservative_graphics())
+    {
+        desktop_notify(
+            boot_mode_is_recovery() ?
+                "Recovery: conservative software graphics active" :
+                "Safe Mode: conservative software graphics active",
+            6000U
+        );
+    }
+    else if (virtio_gpu_available())
     {
         desktop_notify(
             "Display: Virtio-GPU scanout with stable composited cursor",
@@ -5860,10 +7689,10 @@ static void start_gui(void)
         5,
         (int32_t)(screen_width / 2U) - 185,
         115,
-        390,
-        290,
-        340,
-        240,
+        470,
+        410,
+        420,
+        370,
         "Settings",
         GUI_APP_SETTINGS
     );
@@ -5878,6 +7707,19 @@ static void start_gui(void)
         290,
         "Process Manager",
         GUI_APP_PROCESS_MANAGER
+    );
+
+    initialize_window(
+        7,
+        (int32_t)(screen_width / 2U) - 310,
+        86,
+        620,
+        420,
+        520,
+        330,
+        recovery_panel_active ?
+            "LatterOS Recovery" : "Install LatterOS",
+        GUI_APP_INSTALLER
     );
 
     for (uint32_t index = 0; index < GUI_WINDOW_COUNT; index++)
@@ -5903,8 +7745,9 @@ static void start_gui(void)
     window_order[2] = 4;
     window_order[3] = 5;
     window_order[4] = 6;
-    window_order[5] = 1;
-    window_order[6] = 0;
+    window_order[5] = 7;
+    window_order[6] = 1;
+    window_order[7] = 0;
 
     gui_terminal_reset_output();
     gui_terminal_append(
@@ -5946,6 +7789,17 @@ static void start_gui(void)
     launcher_dynamic_count = 0;
     desktop_hovered_icon = UINT32_MAX;
     desktop_selected_icon = UINT32_MAX;
+    installer_refresh();
+    installer_selected_target =
+        installer_target_count() == 0 ? UINT32_MAX : 0U;
+    clear_text(installer_status, sizeof(installer_status));
+    copy_text(
+        installer_status,
+        sizeof(installer_status),
+        installer_target_count() == 0 ?
+            installer_last_error() :
+            "Select the dedicated blank target disk"
+    );
 
     clock_text[0] = '-';
     clock_text[1] = '-';
@@ -5959,20 +7813,78 @@ static void start_gui(void)
     keyboard_set_character_handler(gui_keyboard_input);
     keyboard_set_event_handler(gui_keyboard_event);
 
-    desktop_notify("Milestone 17 desktop services ready", 4500U);
+    desktop_notify(
+        animations_enabled ?
+            "Compositor: layered window surfaces and animations ready" :
+            "Compositor: animations disabled for conservative boot mode",
+        5000U
+    );
+
+    if (first_boot_notification_pending)
+    {
+        desktop_notify(
+            "Welcome to the installed LatterOS system",
+            7000U
+        );
+        first_boot_notification_pending = false;
+    }
+
+    if (boot_mode_is_safe())
+    {
+        desktop_notify(
+            "Safe Mode: use Recovery tools for disk checks",
+            6500U
+        );
+    }
+
+    if (boot_mode_is_recovery())
+    {
+        recovery_panel_active = true;
+        windows[7].title = "LatterOS Recovery";
+        activate_window(7);
+        desktop_notify(
+            "Recovery mode started - destructive actions require confirmation",
+            7000U
+        );
+    }
+
+    if (boot_mode_is_hardware_test())
+    {
+        settings_page = SETTINGS_PAGE_HARDWARE;
+        activate_window(5);
+        desktop_notify(
+            "Hardware Test mode: conservative graphics and compatibility dashboard active",
+            7500U
+        );
+    }
+
     visible_notification_count = desktop_notification_count();
     compositor_invalidate_all();
 }
 
 void gui_init(void)
 {
+    boot_mode_init();
     app_suite_init();
+    (void)user_home_ensure();
+    release_info_init();
+    hardware_compat_init();
+    package_manager_init();
+    first_boot_notification_pending =
+        boot_mode_prepare_first_boot();
     desktop_services_init();
     desktop_editor_init();
+    installer_init();
+    recovery_init();
+    window_surface_init();
+    window_animation_init();
 
     initialized = true;
     active = false;
     start_requested = false;
+    animations_enabled = !boot_mode_conservative_graphics();
+    recovery_panel_active = boot_mode_is_recovery();
+    settings_page = SETTINGS_PAGE_APPEARANCE;
     event_read_index = 0;
     event_write_index = 0;
     cursor_visible = false;
@@ -5996,6 +7908,15 @@ void gui_init(void)
     desktop_hovered_icon = UINT32_MAX;
     desktop_selected_icon = UINT32_MAX;
     visible_notification_count = 0;
+    installer_selected_target = UINT32_MAX;
+    installer_visible_progress = 0U;
+    clear_text(installer_status, sizeof(installer_status));
+    clear_text(installer_report.message, sizeof(installer_report.message));
+
+    for (uint32_t index = 0; index < GUI_WINDOW_COUNT; index++)
+    {
+        animation_target_valid[index] = false;
+    }
 }
 
 void gui_notify_session_changed(void)
@@ -6016,6 +7937,78 @@ void gui_request_start(void)
     start_requested = true;
 }
 
+static void update_installer_background(void)
+{
+    if (installer_running())
+    {
+        uint32_t percentage = installer_visible_progress;
+        char message[INSTALLER_MESSAGE_CAPACITY];
+        clear_text(message, sizeof(message));
+
+        if (installer_progress(
+            &percentage,
+            message,
+            sizeof(message)
+        ))
+        {
+            clear_text(
+                installer_status,
+                sizeof(installer_status)
+            );
+            append_text(
+                installer_status,
+                sizeof(installer_status),
+                "["
+            );
+            append_unsigned_decimal(
+                installer_status,
+                sizeof(installer_status),
+                percentage
+            );
+            append_text(
+                installer_status,
+                sizeof(installer_status),
+                "%] "
+            );
+            append_text(
+                installer_status,
+                sizeof(installer_status),
+                message
+            );
+            installer_visible_progress = percentage;
+            invalidate_window(7);
+        }
+
+        return;
+    }
+
+    installer_report_t completed;
+
+    if (!installer_take_completion(&completed))
+    {
+        return;
+    }
+
+    installer_report = completed;
+    installer_visible_progress = completed.success ? 100U : 0U;
+    copy_text(
+        installer_status,
+        sizeof(installer_status),
+        completed.message
+    );
+
+    desktop_notify(
+        completed.success ?
+            "LatterOS installed and verified" :
+            "LatterOS installation failed",
+        completed.success ? 6000U : 8000U
+    );
+
+    installer_refresh();
+    invalidate_window(7);
+    compositor_invalidate_all();
+}
+
 void gui_update(void)
 {
     if (start_requested && !active)
@@ -6029,6 +8022,7 @@ void gui_update(void)
     }
 
     display_update();
+    update_installer_background();
 
     bool render_frame = frame_is_due();
 
@@ -6042,6 +8036,7 @@ void gui_update(void)
         compositor_invalidate_all();
     }
 
+    update_window_animations();
     update_mouse_events();
     process_events();
 

@@ -1,0 +1,31 @@
+{
+  "architecture": "x86_64",
+  "artifacts": [
+    {
+      "name": "LatterOS-0.19.0-alpha-x86_64.iso",
+      "sha256": "265d64406d177e739b3ce6d7385eedafc73e61121080004305408e61b8d0c4b2",
+      "size": 6406144
+    },
+    {
+      "name": "LatterOS-0.19.0-alpha-x86_64-installed.img",
+      "sha256": "f555f3fadf992a2ab5a1c0dbc045dc18fb1e918416d160e22c21e107b0a7f83f",
+      "size": 536870912
+    },
+    {
+      "name": "LatterOS-0.19.0-alpha-x86_64-recovery.iso",
+      "sha256": "045f92e6b2025e3c7e2a232db1f5ea16c4e1c146f6c6e38d0de227e8b21c19cf",
+      "size": 6406144
+    },
+    {
+      "name": "hello-1.0.0.lpkg",
+      "sha256": "09f399ce8c004514b4945450508ad462b5d28caa0f0655b57834eeb5ef33a4b0",
+      "size": 262
+    }
+  ],
+  "build_time_utc": "2026-07-28T01:45:50Z",
+  "channel": "alpha",
+  "milestone": "19D",
+  "name": "LatterOS",
+  "source_date_epoch": 1785203150,
+  "version": "0.19.0-alpha"
+}

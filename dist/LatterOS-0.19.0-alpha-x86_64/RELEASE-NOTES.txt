@@ -1,0 +1,10 @@
+LatterOS 0.19.0-alpha
+Milestone 19D (alpha)
+
+Artifacts:
+- Bootable installer ISO with normal, Safe Mode, and Recovery entries
+- Installed UEFI disk image
+- Recovery-first ISO
+- LPKG v1 demo application package
+
+The release is intended for QEMU and early hardware testing.

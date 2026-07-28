@@ -1,0 +1,16 @@
+[2J[001;001H[=3h[2J[001;001H[2J[001;001H[8;056;240t[2J[001;001H[2J[001;001H[=3h[2J[001;001H[2J[001;001H[8;040;128t[2J[001;001HBdsDxe: loading Boot0002 "UEFI QEMU HARDDISK QM00005 " from PciRoot(0x0)/Pci(0x3,0x0)/Sata(0x0,0xFFFF,0x0)
+BdsDxe: starting Boot0002 "UEFI QEMU HARDDISK QM00005 " from PciRoot(0x0)/Pci(0x3,0x0)/Sata(0x0,0xFFFF,0x0)
+[001;001H[001;001H[000001] INFO boot: LatterOS starting; framebuffer=1280x800 pitch=5120 serial=ready
+[000002] INFO cpu: GDT and IDT initialized
+[000003] INFO acpi: tables=ready root=XSDT cpus=4 ioapics=1
+[000004] INFO memory: usable=1972852 KiB pages=493213 free=262143
+[000005] INFO process: Process scheduler initialized
+[000006] INFO pci: devices=7 storage=detected ahci-disks=1
+[000007] WARN filesystem: Persistent /home unavailable; using RAM fallback
+[000008] INFO security: session user=user uid=1000
+[000009] INFO usb: controller=ready connected=2 enumerated=3 keyboard=USB mouse=USB storage=0
+[000010] WARN network: Network card not available
+[000011] INFO interrupts: x2APIC=enabled controller=I/O APIC bsp-apic-id=0
+[000012] INFO timer: PIT configured at 1000 Hz
+[000013] INFO smp: discovered=4 online=4 mode=x2APIC ap-workers=3
+[000014] INFO desktop: Desktop startup requested

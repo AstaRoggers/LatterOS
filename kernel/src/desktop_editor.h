@@ -30,6 +30,10 @@ bool desktop_editor_copy(bool cut);
 bool desktop_editor_paste(void);
 void desktop_editor_select_all(void);
 bool desktop_editor_save(void);
+bool desktop_editor_save_as(const char *path);
+void desktop_editor_request_save_as(void);
+bool desktop_editor_take_save_as_request(void);
+bool desktop_editor_read_only(void);
 
 bool desktop_editor_has_selection(void);
 bool desktop_editor_dirty(void);

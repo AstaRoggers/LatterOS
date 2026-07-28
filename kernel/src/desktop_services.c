@@ -7,8 +7,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define DESKTOP_CONFIG_PATH "/home/.latteros-desktop.cfg"
-#define DESKTOP_THEME_PATH  "/home/latteros.theme"
+#define DESKTOP_CONFIG_PATH "/home/user/.latteros-desktop.cfg"
+#define DESKTOP_THEME_PATH  "/home/user/latteros.theme"
 #define DESKTOP_CONFIG_BUFFER_SIZE 4096U
 
 static gui_theme_t current_theme;
@@ -396,6 +396,22 @@ static void apply_builtin_theme(desktop_theme_kind_t kind)
             current_theme.row_selected = 0xDEC2E2U;
             break;
 
+        case DESKTOP_THEME_LDS:
+            current_theme.desktop = 0x102A43U;
+            current_theme.taskbar = 0x081A2BU;
+            current_theme.taskbar_top = 0xC7A84BU;
+            current_theme.window = 0xF2F5F7U;
+            current_theme.window_border = 0x173A59U;
+            current_theme.title_active = 0x1E527CU;
+            current_theme.title_idle = 0x587386U;
+            current_theme.text = 0x102536U;
+            current_theme.light_text = 0xFFFFFFU;
+            current_theme.field = 0xFFFFFFU;
+            current_theme.accent = 0xC7A84BU;
+            current_theme.close = 0xA74444U;
+            current_theme.row_selected = 0xE6D89AU;
+            break;
+
         case DESKTOP_THEME_BLUE:
         case DESKTOP_THEME_EXTERNAL:
         case DESKTOP_THEME_COUNT:
@@ -550,7 +566,7 @@ static void parse_key_value_lines(
         }
         else if (
             key[0] == 'w' &&
-            key[1] >= '0' && key[1] <= '6' &&
+            key[1] >= '0' && key[1] <= '7' &&
             key[2] == '_'
         )
         {
@@ -774,6 +790,60 @@ void desktop_services_cycle_theme(void)
     (void)desktop_services_save();
 }
 
+bool desktop_services_set_theme(desktop_theme_kind_t kind)
+{
+    desktop_services_init();
+
+    if (kind >= DESKTOP_THEME_COUNT)
+    {
+        return false;
+    }
+
+    theme_kind = kind;
+
+    if (theme_kind == DESKTOP_THEME_EXTERNAL)
+    {
+        if (!desktop_services_reload_external_theme())
+        {
+            theme_kind = DESKTOP_THEME_BLUE;
+            apply_builtin_theme(theme_kind);
+            return false;
+        }
+    }
+    else
+    {
+        apply_builtin_theme(theme_kind);
+    }
+
+    return desktop_services_save();
+}
+
+bool desktop_services_set_wallpaper(desktop_wallpaper_t kind)
+{
+    desktop_services_init();
+
+    if (kind >= DESKTOP_WALLPAPER_COUNT)
+    {
+        return false;
+    }
+
+    wallpaper_kind = kind;
+    return desktop_services_save();
+}
+
+bool desktop_services_reset_configuration(void)
+{
+    desktop_services_init();
+
+    theme_kind = DESKTOP_THEME_BLUE;
+    wallpaper_kind = DESKTOP_WALLPAPER_GRADIENT;
+    recent_file_count = 0;
+    clear_bytes(saved_windows, sizeof(saved_windows));
+    clear_bytes(recent_files, sizeof(recent_files));
+    apply_builtin_theme(theme_kind);
+    return desktop_services_save();
+}
+
 void desktop_services_cycle_wallpaper(void)
 {
     desktop_services_init();
@@ -800,6 +870,8 @@ const char *desktop_services_theme_name(void)
             return "Aubergine";
         case DESKTOP_THEME_EXTERNAL:
             return "External";
+        case DESKTOP_THEME_LDS:
+            return "LDS";
         default:
             return "Unknown";
     }
@@ -1180,6 +1252,11 @@ desktop_association_t desktop_association_for_path(
     )
     {
         return DESKTOP_ASSOCIATION_EXECUTABLE;
+    }
+
+    if (string_ends_with_case_insensitive(path, ".lpkg"))
+    {
+        return DESKTOP_ASSOCIATION_PACKAGE;
     }
 
     return DESKTOP_ASSOCIATION_UNKNOWN;

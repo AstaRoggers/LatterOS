@@ -1,5 +1,6 @@
 #include "display.h"
 
+#include "boot_mode.h"
 #include "graphics.h"
 #include "surface.h"
 #include "timer.h"
@@ -306,6 +307,7 @@ void display_init(void)
 
     if (
         buffering_available &&
+        !boot_mode_conservative_graphics() &&
         virtio_gpu_init(active_width, active_height)
     )
     {

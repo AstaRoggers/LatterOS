@@ -8,7 +8,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define DESKTOP_SERVICE_WINDOW_COUNT 7U
+#define DESKTOP_SERVICE_WINDOW_COUNT 8U
 #define DESKTOP_RECENT_FILE_COUNT 5U
 #define DESKTOP_RECENT_PATH_CAPACITY 256U
 #define DESKTOP_CLIPBOARD_CAPACITY 1024U
@@ -31,6 +31,7 @@ typedef enum
     DESKTOP_THEME_TEAL,
     DESKTOP_THEME_AUBERGINE,
     DESKTOP_THEME_EXTERNAL,
+    DESKTOP_THEME_LDS,
     DESKTOP_THEME_COUNT
 } desktop_theme_kind_t;
 
@@ -39,7 +40,8 @@ typedef enum
     DESKTOP_ASSOCIATION_UNKNOWN,
     DESKTOP_ASSOCIATION_TEXT,
     DESKTOP_ASSOCIATION_IMAGE,
-    DESKTOP_ASSOCIATION_EXECUTABLE
+    DESKTOP_ASSOCIATION_EXECUTABLE,
+    DESKTOP_ASSOCIATION_PACKAGE
 } desktop_association_t;
 
 typedef struct
@@ -64,6 +66,9 @@ desktop_wallpaper_t desktop_services_wallpaper(void);
 
 void desktop_services_cycle_theme(void);
 void desktop_services_cycle_wallpaper(void);
+bool desktop_services_set_theme(desktop_theme_kind_t kind);
+bool desktop_services_set_wallpaper(desktop_wallpaper_t kind);
+bool desktop_services_reset_configuration(void);
 bool desktop_services_reload_external_theme(void);
 const char *desktop_services_theme_name(void);
 const char *desktop_services_wallpaper_name(void);

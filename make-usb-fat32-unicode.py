@@ -6,6 +6,7 @@ from __future__ import annotations
 import math
 import struct
 import sys
+import zlib
 from pathlib import Path
 
 SECTOR_SIZE = 512
@@ -222,6 +223,43 @@ def write_fsinfo(image: bytearray, used_clusters: int) -> None:
     image[backup : backup + SECTOR_SIZE] = fsinfo
 
 
+
+def build_demo_package() -> bytes:
+    manifest = (
+        "name=hello\n"
+        "version=1.0.0\n"
+        "description=Small LatterOS package-system demo\n"
+        "depends=\n"
+        "entry=README.txt\n"
+    ).encode("utf-8")
+    payload = (
+        "Hello from LPKG.\n"
+        "This file was installed by the LatterOS package manager.\n"
+    ).encode("utf-8")
+    path = b"README.txt"
+    table = struct.pack(
+        "<HHIII",
+        len(path),
+        0,
+        0,
+        len(payload),
+        zlib.crc32(payload) & 0xFFFFFFFF,
+    ) + path
+    body = manifest + table + payload
+    header = struct.pack(
+        "<8s7I28s",
+        b"LPKGv1\0\0",
+        64,
+        1,
+        len(manifest),
+        1,
+        len(table),
+        len(payload),
+        zlib.crc32(body) & 0xFFFFFFFF,
+        bytes(28),
+    )
+    return header + body
+
 def main() -> None:
     output = Path(
         sys.argv[1]
@@ -231,6 +269,16 @@ def main() -> None:
 
     image = bytearray(TOTAL_SECTORS * SECTOR_SIZE)
     write_boot_sector(image)
+
+    package_path = Path(sys.argv[2]) if len(sys.argv) > 2 else None
+    demo_package = (
+        package_path.read_bytes()
+        if package_path is not None and package_path.exists()
+        else build_demo_package()
+    )
+
+    if len(demo_package) > SECTOR_SIZE * SECTORS_PER_CLUSTER:
+        raise ValueError("demo LPKG must fit in one FAT32 cluster")
 
     readme = (
         "Welcome to the LatterOS FAT32 USB drive!\r\n"
@@ -268,6 +316,7 @@ def main() -> None:
         5: georgian,
         7: guide,
         8: write_test,
+        9: demo_package,
     }
 
     root = bytearray(SECTOR_SIZE)
@@ -329,6 +378,16 @@ def main() -> None:
         len(write_test),
     )
 
+    offset = append_named_entry(
+        root,
+        offset,
+        "hello-1.0.0.lpkg",
+        short_name("HELLO~1", "LPK"),
+        0x20,
+        9,
+        len(demo_package),
+    )
+
     root[offset] = 0
 
     documents = bytearray(SECTOR_SIZE)
@@ -358,7 +417,7 @@ def main() -> None:
 
     documents[offset] = 0
 
-    used_clusters = 7
+    used_clusters = 8
     write_fsinfo(image, used_clusters)
 
     fat = bytearray(SECTORS_PER_FAT * SECTOR_SIZE)
@@ -372,6 +431,7 @@ def main() -> None:
         6: 0x0FFFFFFF,
         7: 0x0FFFFFFF,
         8: 0x0FFFFFFF,
+        9: 0x0FFFFFFF,
     }
 
     for cluster, value in values.items():
@@ -389,13 +449,14 @@ def main() -> None:
     write_cluster(image, 6, documents)
     write_cluster(image, 7, guide)
     write_cluster(image, 8, write_test)
+    write_cluster(image, 9, demo_package)
 
     output.write_bytes(image)
 
     print(
         f"Created {output} "
         f"({len(image) // (1024 * 1024)} MiB "
-        "writable FAT32 + Unicode VFAT)"
+        "writable FAT32 + Unicode VFAT + LPKG demo)"
     )
 
 

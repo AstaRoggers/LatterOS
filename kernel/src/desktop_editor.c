@@ -25,6 +25,7 @@ static vfs_node_t *open_node;
 static bool dirty;
 static bool selecting;
 static bool initialized;
+static bool save_as_requested;
 static char status_text[96];
 
 
@@ -102,12 +103,24 @@ static ui_rect_t save_button_bounds(const ui_rect_t *content)
     };
 }
 
-static ui_rect_t select_button_bounds(const ui_rect_t *content)
+static ui_rect_t save_as_button_bounds(const ui_rect_t *content)
 {
     ui_rect_t toolbar = toolbar_bounds(content);
 
     return (ui_rect_t){
         toolbar.x + 82,
+        toolbar.y + 4,
+        82,
+        24
+    };
+}
+
+static ui_rect_t select_button_bounds(const ui_rect_t *content)
+{
+    ui_rect_t toolbar = toolbar_bounds(content);
+
+    return (ui_rect_t){
+        toolbar.x + 170,
         toolbar.y + 4,
         92,
         24
@@ -390,7 +403,8 @@ void desktop_editor_init(void)
     open_node = NULL;
     dirty = false;
     selecting = false;
-    set_status("No file open");
+    save_as_requested = false;
+    set_status("No file open - use Save As");
 }
 
 void desktop_editor_open_node(vfs_node_t *node)
@@ -419,44 +433,149 @@ void desktop_editor_open_node(vfs_node_t *node)
     open_node = node;
     dirty = false;
     selecting = false;
-    set_status(
-        count + 1U < sizeof(text_buffer) ?
-            "File loaded" : "File truncated to editor capacity"
-    );
+    save_as_requested = false;
+
+    if (!vfs_check_access(node, VFS_ACCESS_WRITE))
+    {
+        set_status("Read-only - use Save As");
+    }
+    else
+    {
+        set_status(
+            count + 1U < sizeof(text_buffer) ?
+                "File loaded" : "File truncated to editor capacity"
+        );
+    }
+}
+
+static bool write_current_document(vfs_node_t *node)
+{
+    if (
+        node == NULL ||
+        node->type != VFS_NODE_FILE ||
+        !vfs_check_access(node, VFS_ACCESS_WRITE) ||
+        !vfs_truncate(node)
+    )
+    {
+        return false;
+    }
+
+    if (
+        text_length_value != 0 &&
+        vfs_write(
+            node,
+            0,
+            text_buffer,
+            text_length_value
+        ) != text_length_value
+    )
+    {
+        return false;
+    }
+
+    node->size = text_length_value;
+    return true;
 }
 
 bool desktop_editor_save(void)
 {
     desktop_editor_init();
 
-    if (open_node == NULL)
-    {
-        set_status("Open a file before saving");
-        return false;
-    }
-
     if (
-        !vfs_truncate(open_node) ||
-        (
-            text_length_value != 0 &&
-            vfs_write(
-                open_node,
-                0,
-                text_buffer,
-                text_length_value
-            ) != text_length_value
-        )
+        open_node == NULL ||
+        !vfs_check_access(open_node, VFS_ACCESS_WRITE)
     )
     {
-        set_status("Save failed");
+        save_as_requested = true;
+        set_status(
+            open_node == NULL ?
+                "Choose a file name with Save As" :
+                "Permission denied - use Save As"
+        );
         return false;
     }
 
-    open_node->size = text_length_value;
+    if (!write_current_document(open_node))
+    {
+        set_status("Save failed - filesystem rejected the write");
+        desktop_notify("Unable to save document", 4500U);
+        return false;
+    }
+
     dirty = false;
+    save_as_requested = false;
     set_status("Saved");
     desktop_notify("Document saved", 3000U);
     return true;
+}
+
+bool desktop_editor_save_as(const char *path)
+{
+    desktop_editor_init();
+
+    if (path == NULL || path[0] == '\0')
+    {
+        set_status("Save As requires a file name");
+        return false;
+    }
+
+    vfs_node_t *node = vfs_open(path);
+
+    if (node == NULL)
+    {
+        if (!vfs_create_file(path))
+        {
+            set_status("Save As failed - directory is not writable");
+            desktop_notify("Unable to create document", 4500U);
+            return false;
+        }
+
+        node = vfs_open(path);
+    }
+
+    if (
+        node == NULL ||
+        node->type != VFS_NODE_FILE ||
+        !write_current_document(node)
+    )
+    {
+        set_status("Save As failed - permission denied");
+        desktop_notify("Unable to save document", 4500U);
+        return false;
+    }
+
+    open_node = node;
+    dirty = false;
+    save_as_requested = false;
+    set_status("Saved as writable document");
+    desktop_recent_add(path);
+    desktop_notify("Document saved", 3000U);
+    return true;
+}
+
+void desktop_editor_request_save_as(void)
+{
+    desktop_editor_init();
+    save_as_requested = true;
+    set_status("Choose a writable destination");
+}
+
+bool desktop_editor_take_save_as_request(void)
+{
+    desktop_editor_init();
+
+    bool requested = save_as_requested;
+    save_as_requested = false;
+    return requested;
+}
+
+bool desktop_editor_read_only(void)
+{
+    desktop_editor_init();
+
+    return
+        open_node != NULL &&
+        !vfs_check_access(open_node, VFS_ACCESS_WRITE);
 }
 
 static void render_line_number(
@@ -503,6 +622,7 @@ void desktop_editor_render(const ui_rect_t *content)
     ui_rect_t scrollbar = scrollbar_bounds(content);
     ui_rect_t status = status_bounds(content);
     ui_rect_t save = save_button_bounds(content);
+    ui_rect_t save_as = save_as_button_bounds(content);
     ui_rect_t select = select_button_bounds(content);
 
     ui_control_draw_toolbar(&toolbar, &colors);
@@ -512,6 +632,12 @@ void desktop_editor_render(const ui_rect_t *content)
         &colors,
         open_node == NULL ?
             UI_CONTROL_DISABLED : UI_CONTROL_NORMAL
+    );
+    ui_control_draw_button(
+        &save_as,
+        "Save As",
+        &colors,
+        UI_CONTROL_NORMAL
     );
     ui_control_draw_button(
         &select,
@@ -524,9 +650,9 @@ void desktop_editor_render(const ui_rect_t *content)
     ui_draw_text_ellipsized(
         open_node == NULL ? "Untitled" : open_node->name,
         &(ui_rect_t){
-            toolbar.x + 184,
+            toolbar.x + 272,
             toolbar.y + 4,
-            toolbar.width > 190U ? toolbar.width - 190U : 1U,
+            toolbar.width > 278U ? toolbar.width - 278U : 1U,
             24
         },
         4,
@@ -685,13 +811,21 @@ bool desktop_editor_handle_click(
     }
 
     ui_rect_t save = save_button_bounds(content);
+    ui_rect_t save_as = save_as_button_bounds(content);
     ui_rect_t select = select_button_bounds(content);
     ui_rect_t text = text_area_bounds(content);
     ui_rect_t scrollbar = scrollbar_bounds(content);
 
     if (ui_point_in_rect(x, y, &save))
     {
-        return desktop_editor_save();
+        (void)desktop_editor_save();
+        return true;
+    }
+
+    if (ui_point_in_rect(x, y, &save_as))
+    {
+        desktop_editor_request_save_as();
+        return true;
     }
 
     if (ui_point_in_rect(x, y, &select))
@@ -874,5 +1008,5 @@ bool desktop_editor_dirty(void)
 
 const char *desktop_editor_name(void)
 {
-    return open_node == NULL ? "Untitled" : open_node->name;
+    return open_node == NULL ? "Untitled.txt" : open_node->name;
 }
